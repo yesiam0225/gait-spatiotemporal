@@ -1,0 +1,278 @@
+# Spatiotemporal Gait Analysis for Obstacle Crossing
+
+A Python package for detecting gait events and computing spatiotemporal parameters from 3D motion capture data of obstacle-crossing walking trials. Designed for biomechanics research with full-body Plug-in Gait marker sets.
+
+## Installation
+
+```bash
+git clone <repository-url> gait-spatiotemporal
+cd gait-spatiotemporal
+pip install -e .
+```
+
+This installs the import name `spatiotemporal` and the CLI command `spatiotemporal-gait`.
+
+## Command-line interface
+
+After installation, you can run the same entrypoint as `python -m spatiotemporal`:
+
+```bash
+# Single trial: marker CSV → per-stride CSV
+spatiotemporal-gait --input trial.csv --output strides.csv \
+  --leg-length-mm 850 --subject-id BBA01 --group adult --board RB --time pre --trial 5
+
+# Batch: manifest CSV (columns csv_path, trial) + output directory
+spatiotemporal-gait --trial-manifest trials.csv --output-dir ./out \
+  --leg-length-mm 960 --subject-id BBA01 --group adult --board RB --time pre
+
+# Batch: JSON spec (positional path)
+spatiotemporal-gait analysis_spec.json
+```
+
+Use `spatiotemporal-gait --help` for all options.
+
+## Features
+
+- **Pelvis-independent gait event detection** using foot kinematics only (heel and toe markers)
+- **Robust to atypical landing patterns** including toe-strike (TS) landings common after obstacle crossing
+- **Z-minimum priority algorithm** for heel-strike detection, handling biphasic heel-rocker landings where velocity sign changes occur multiple times per cycle
+- **Automatic obstacle detection** and lead/trail foot classification
+- **Stride-level parameters** including stride length, stride time, stance/swing percentages, single/double support, gait speed, step length, step time, step width
+- **Anthropometric normalization** by leg length and √(g/L) for cross-subject comparison
+- **IQR-based outlier flagging** within group, with optional physiological bounds
+- **Five CSV outputs** at different aggregation levels (per stride / per trial × phase / per trial obstacle / per subject / per subject obstacle)
+
+## Requirements
+
+- Python 3.10+
+- NumPy, SciPy, pandas (installed automatically with `pip install -e .`)
+
+## Input Format
+
+CSV file with one column per marker coordinate, named as `MARKER_axis` where axis is `x`, `y`, or `z`. A `frame` column is required. Example markers:
+
+- `LHEE`, `LTOE` — left heel and toe
+- `RHEE`, `RTOE` — right heel and toe
+- `LASI`, `RASI` — left and right ASIS (anterior superior iliac spine) for walking setup and step width
+- `OBSTACLE_L`, `OBSTACLE_R` — obstacle marker pair (configurable name)
+
+Units are millimeters. Sampling rate is configurable (default 100 Hz, matching Vicon standard for full-body capture).
+
+Example column names: `frame`, `LHEE_x`, `LHEE_y`, `LHEE_z`, `LTOE_x`, ..., `OBSTACLE_L_z`.
+
+## Quick Start
+
+### Single trial analysis
+
+```python
+from spatiotemporal import analyze_trial, TrialMetadata, Anthropometry
+
+records, obstacle, events, setup = analyze_trial(
+    csv_path='BBA01_Trial_05.csv',
+    metadata=TrialMetadata(
+        subject_id='BBA01',
+        group='adult',
+        board='RB',
+        time='pre',
+        trial=5,
+    ),
+    anthro=Anthropometry(leg_length_mm=850, age_years=30),
+)
+
+# events: GaitEvents with left_hs, right_hs, left_to, right_to,
+#          left_strike_types, right_strike_types ('HS' or 'TS')
+# records: list of StrideRecord (one per stride)
+# obstacle: ObstacleParameters (foot clearances, crossing speed, etc.)
+# setup: WalkingSetup (walking axis, direction, obstacle position)
+
+for hs, strike in zip(events.left_hs, events.left_strike_types):
+    print(f"Left IC frame {hs+1}: {strike}")
+```
+
+### Multi-trial batch with CSV output
+
+```python
+from spatiotemporal import analyze_trials, TrialMetadata, Anthropometry
+
+trial_specs = []
+for trial_num in range(1, 7):
+    trial_specs.append({
+        'csv_path': f'data/BBA01_Trial_{trial_num:02d}.csv',
+        'metadata': TrialMetadata(
+            subject_id='BBA01',
+            group='adult',
+            board='RB',
+            time='pre',
+            trial=trial_num,
+        ),
+        'anthropometry': Anthropometry(leg_length_mm=850, age_years=30),
+    })
+
+paths = analyze_trials(
+    trial_specs=trial_specs,
+    output_dir='./output',
+    sampling_rate=100.0,
+)
+# paths: dict with keys 'per_stride', 'per_trial_phase', 'per_trial_obstacle',
+#        'per_subject', 'per_subject_obstacle' mapping to CSV file paths
+```
+
+## Output Files
+
+| File | Unit of analysis | Use case |
+|------|------------------|----------|
+| `per_stride_data.csv` | One row per stride | Detailed inspection, custom aggregation |
+| `per_trial_phase_summary.csv` | Trial × phase mean | Trial-level comparison |
+| `per_trial_obstacle.csv` | Trial | Obstacle-crossing kinematics |
+| `per_subject_summary.csv` | Subject × board × time × phase mean | ANOVA-ready (group × board × time) |
+| `per_subject_obstacle_summary.csv` | Subject × board × time mean | ANOVA-ready obstacle parameters |
+
+### Key columns in `per_stride_data.csv`
+
+- **Identification**: `subject_id`, `group`, `board`, `time`, `trial`, `stride_idx_in_trial`, `side`, `phase`
+- **Event frames**: `hs_start_frame`, `hs_end_frame`, `to_frame`, `opp_hs_frame`, `opp_to_frame`, `ic_start_strike_type` ('HS' or 'TS')
+- **Temporal**: `stride_time_s`, `stance_pct`, `swing_pct`, `double_support_1_pct`, `double_support_2_pct`, `single_support_pct`, `step_time_s`
+- **Spatial**: `stride_length_mm`, `gait_speed_m_s`, `step_length_mm`, `step_width_mm`
+- **Normalized**: `stride_length_norm`, `stride_time_norm`, `gait_speed_norm`, `step_length_norm`, `step_time_norm`, `step_width_norm`
+- **Quality**: `outlier_flag` (IQR-based within group)
+
+## Stride Phase Classification
+
+Each stride is automatically labeled by its position relative to the obstacle:
+
+- `approach` — strides before obstacle crossing
+- `crossing_lead` — the lead foot's stride that clears the obstacle
+- `crossing_trail` — the trail foot's stride that clears the obstacle
+- `recovery` — strides after obstacle crossing
+
+## Algorithm Overview
+
+### Heel-Strike Detection (Z-minimum priority)
+
+Within each gait cycle (between consecutive heel swing peaks), the algorithm finds **all** Vz sign-change candidates (velocity transitions from negative to positive) and picks the one at the **deepest Z value**. This correctly handles biphasic heel-rocker landings where the heel first contacts the ground at higher Z, lifts slightly, then settles to a deeper plateau. The first sign-change in such cases would be a false detection (Z too high above ground); the deepest sign-change is the true HS.
+
+Z near ground (≤ ground + 40 mm) is required to filter mid-stance noise.
+
+### Toe-Off Detection (IC-bounded first acceleration peak)
+
+Per swing cycle (defined by toe Z swing peaks), the first positive Az peak satisfying these criteria is selected:
+
+- Vz > 100 mm/s (toe rising)
+- Z ≤ ground + 50 mm (leaving ground)
+- Z rises ≥ 20 mm in next 10 frames (sustained motion, not noise)
+
+Search window is bounded by the previous IC (more accurate than swing-peak bounding, which can be confused by trial-start transients).
+
+### Toe-Strike Detection (strict criteria)
+
+Per cycle in toe Z, the deepest Z sign-change with these criteria:
+
+- Z at strike ≤ ground + 20 mm (must be at ground level)
+- Vz[strike-1] < -100 mm/s (toe still descending one frame before impact)
+- Pre-10 frames: all Vz < 0, mean |Vz| ≥ 200 mm/s (real swing landing)
+- Pre-swing peak ≥ ground + 50 mm (real swing, not stance oscillation)
+- Az peak ≥ 10000 mm/s² nearby (impact deceleration)
+
+Validated only if same-foot HS follows within 30 frames (heel rocker after toe contact). The paired HS is then excluded from separate IC counting (it is part of the toe-strike's stance).
+
+### Derivative Computation
+
+Velocities and accelerations are computed using **backward difference** on **raw (unfiltered)** marker data:
+
+- V[i] = (X[i] - X[i-1]) / Δt
+- A[i] = (V[i] - V[i-1]) / Δt
+
+Raw data is used because Butterworth filtering shifts Az peak positions and masks the sharp transitions characteristic of toe-strike impacts. Filtered markers are still used for stride length and other spatial parameter computation, where smoothing is beneficial.
+
+## Validation
+
+Algorithm validated against manual frame-by-frame identification on three trial types:
+
+| Trial | Subject | Direction | Lead foot | HS accuracy | TS accuracy |
+|-------|---------|-----------|-----------|-------------|-------------|
+| BBA01 T5 | Adult | +1 | Right | ±1-2 frames | Exact |
+| BBA02 T5 | Adult | +1 | Left | ±1-2 frames | Exact |
+| BBC01 T23 | Child | -1 | Right | ±1-2 frames | Exact |
+
+## API Reference
+
+### `TrialMetadata(subject_id, group, board, time, trial)`
+
+- `subject_id`: str, unique subject identifier
+- `group`: 'adult' or 'child'
+- `board`: 'RB' (regular board) or 'WB' (wide board), or any string identifying experimental condition
+- `time`: 'pre' or 'post' (intervention timing), or any string identifying within-subject condition
+- `trial`: int, trial number within condition
+
+### `Anthropometry(leg_length_mm, age_years=None, height_mm=None, mass_kg=None)`
+
+- `leg_length_mm`: float, required (used for normalization)
+- Other fields optional
+
+### `analyze_trial(csv_path, metadata, anthro, ...)`
+
+Main analysis function for a single trial. Key optional parameters:
+
+- `obstacle_marker_pair`: tuple of two marker names, default `('OBSTACLE_L', 'OBSTACLE_R')`
+- `sampling_rate`: float, default 100.0 Hz
+- `filter_cutoff`: float, default 6.0 Hz (Butterworth low-pass for spatial parameters)
+- `apply_filter`: bool, default True
+- `outlier_iqr_threshold`: float, default 1.5
+- `physiological_bounds`: dict mapping parameter name to (min, max) tuple for hard bounds
+
+Returns `(records, obstacle, events, setup)` tuple.
+
+### `analyze_trials(trial_specs, output_dir, ...)`
+
+Batch analysis with CSV output. Returns dict mapping output type to file path.
+
+### Tunable detection parameters
+
+All thresholds in `detect_gait_events_foot_based()` are exposed as parameters:
+
+| Parameter | Default | Purpose |
+|-----------|---------|---------|
+| `swing_height_above_ground` | 80 mm | Minimum heel swing peak height |
+| `hs_ground_tolerance_mm` | 40 mm | HS Z must be within this of ground |
+| `ts_ground_tolerance_mm` | 20 mm | TS Z must be within this of ground (stricter) |
+| `ts_pre_swing_min_height` | 50 mm | Real toe swing must reach this height before TS |
+| `min_hs_pre_descent_speed` | 30 mm/s | Minimum heel descent speed before HS |
+| `ts_pre_descent_speed` | 200 mm/s | Minimum toe descent speed before TS (swing landing) |
+| `ts_accel_peak_min` | 10000 mm/s² | Minimum impact Az peak for TS |
+| `to_accel_peak_min` | 10000 mm/s² | Minimum push-off Az peak for TO |
+| `ts_validation_max_gap` | 30 frames | Max frames between TS and paired HS |
+
+## Project structure
+
+```
+gait-spatiotemporal/
+├── README.md
+├── pyproject.toml
+└── src/spatiotemporal/
+    ├── __init__.py   # data classes, I/O, detection, analyze_trial / analyze_trials, CLI
+    └── __main__.py   # python -m spatiotemporal
+```
+
+## Limitations
+
+- Designed for obstacle-crossing trials with a single obstacle. Multi-obstacle scenarios will require modification of phase assignment logic.
+- Walking axis is detected automatically from pelvis motion; ensure trials have meaningful forward motion (>50 cm).
+- Sampling rate assumed constant within trial. Variable-rate data is not supported.
+- Marker gap-filling is not performed; gaps in heel/toe trajectories will produce NaN velocities and missed events. Pre-process with gap-filling if needed.
+- Algorithm parameters tuned for adult and child walking at ~1.0-1.5 m/s. Very slow walking (<0.5 m/s) or running may need parameter adjustment.
+
+## License
+
+MIT
+
+## Citation
+
+If you use this package in published research, please cite:
+
+```
+[Citation placeholder - add publication when available]
+```
+
+## Contact
+
+[Your contact information]
