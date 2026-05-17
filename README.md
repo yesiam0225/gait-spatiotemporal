@@ -17,13 +17,18 @@ This installs the import name `spatiotemporal` and the CLI command `spatiotempor
 After installation, you can run the same entrypoint as `python -m spatiotemporal`:
 
 ```bash
-# Single trial: marker CSV → per-stride CSV
+# Single trial: marker CSV → per-stride CSV (+ per-step CSV alongside by default)
 spatiotemporal-gait --input trial.csv --output strides.csv \
   --leg-length-mm 850 --subject-id BBA01 --group adult --board RB --time pre --trial 5
+# Optional: spatiotemporal-gait ... --output-step custom_steps.csv
 
-# Batch: manifest CSV (columns csv_path, trial) + output directory
+# Batch: manifest CSV (csv_path + trial per row) + output directory
 spatiotemporal-gait --trial-manifest trials.csv --output-dir ./out \
   --leg-length-mm 960 --subject-id BBA01 --group adult --board RB --time pre
+# If every row includes leg_length_mm, --leg-length-mm may be omitted.
+# Optional manifest columns (override CLI when present): subject_id, group, board,
+# time, leg_length_mm, mass_kg, age_years, height_mm. Aliases: path/input/file for
+# csv_path; trial_number for trial; leg_length for leg_length_mm; subject, mass, age, height.
 
 # Batch: JSON spec (positional path)
 spatiotemporal-gait analysis_spec.json
@@ -40,7 +45,7 @@ Use `spatiotemporal-gait --help` for all options.
 - **Stride-level parameters** including stride length, stride time, stance/swing percentages, single/double support, gait speed, step length, step time, step width
 - **Anthropometric normalization** by leg length and √(g/L) for cross-subject comparison
 - **IQR-based outlier flagging** within group, with optional physiological bounds
-- **Five CSV outputs** at different aggregation levels (per stride / per trial × phase / per trial obstacle / per subject / per subject obstacle)
+- **Six CSV outputs** at different aggregation levels (per stride / **per step** / per trial × phase / per trial obstacle / per subject / per subject obstacle)
 
 ## Requirements
 
@@ -113,7 +118,7 @@ paths = analyze_trials(
     output_dir='./output',
     sampling_rate=100.0,
 )
-# paths: dict with keys 'per_stride', 'per_trial_phase', 'per_trial_obstacle',
+# paths: dict with keys 'per_stride', 'per_step', 'per_trial_phase', 'per_trial_obstacle',
 #        'per_subject', 'per_subject_obstacle' mapping to CSV file paths
 ```
 
@@ -122,10 +127,18 @@ paths = analyze_trials(
 | File | Unit of analysis | Use case |
 |------|------------------|----------|
 | `per_stride_data.csv` | One row per stride | Detailed inspection, custom aggregation |
+| `per_step_data.csv` | One row per foot IC (landing) | Step time/length/width at each contact |
 | `per_trial_phase_summary.csv` | Trial × phase mean | Trial-level comparison |
 | `per_trial_obstacle.csv` | Trial | Obstacle-crossing kinematics |
 | `per_subject_summary.csv` | Subject × board × time × phase mean | ANOVA-ready (group × board × time) |
 | `per_subject_obstacle_summary.csv` | Subject × board × time mean | ANOVA-ready obstacle parameters |
+
+### Key columns in `per_step_data.csv`
+
+- **Identification**: `subject_id`, `group`, `board`, `time`, `trial`, `step_idx_in_trial` (chronological), `landing_side`, `phase`
+- **Contact**: `ic_frame`, `ic_strike_type`, `prev_opposite_ic_frame` (previous opposite-foot IC, if any)
+- **Step metrics**: `step_time_s`, `step_length_mm`, `step_width_mm` and `*_norm`
+- **Link**: `stride_idx_in_trial` (matching row in `per_stride_data.csv`), `outlier_flag`
 
 ### Key columns in `per_stride_data.csv`
 
@@ -149,9 +162,11 @@ Each stride is automatically labeled by its position relative to the obstacle:
 
 ### Heel-Strike Detection (Z-minimum priority)
 
-Within each gait cycle (between consecutive heel swing peaks), the algorithm finds **all** Vz sign-change candidates (velocity transitions from negative to positive) and picks the one at the **deepest Z value**. This correctly handles biphasic heel-rocker landings where the heel first contacts the ground at higher Z, lifts slightly, then settles to a deeper plateau. The first sign-change in such cases would be a false detection (Z too high above ground); the deepest sign-change is the true HS.
+Within each gait cycle (between consecutive heel swing peaks), the algorithm finds **all** Vz sign-change candidates (velocity transitions from negative to positive). By default it picks the one at the **deepest Z** (≤ ground + 40 mm). This handles biphasic heel-rocker landings where an earlier shallow crossing is not the true HS.
 
-Z near ground (≤ ground + 40 mm) is required to filter mid-stance noise.
+**Flat-foot landing** (when toe Z is available): if min |toe − heel| Z in the cycle is ≤ 15 mm, HS is the **first** near-ground Vz+ with Z ≤ ground + 60 mm instead of deepest Z. This avoids late HS on a low plateau after whole-foot contact (obstacle / low-swing steps).
+
+Otherwise Z near ground (≤ ground + 40 mm) is required to filter mid-stance noise.
 
 ### Toe-Off Detection (IC-bounded first acceleration peak)
 
@@ -159,7 +174,7 @@ Per swing cycle (defined by toe Z swing peaks), the first positive Az peak satis
 
 - Vz > 100 mm/s (toe rising)
 - Z ≤ ground + 50 mm (leaving ground)
-- Z rises ≥ 20 mm in next 10 frames (sustained motion, not noise)
+- Z rises ≥ 15 mm in next 10 frames (sustained motion, not noise)
 
 Search window is bounded by the previous IC (more accurate than swing-peak bounding, which can be confused by trial-start transients).
 
@@ -240,6 +255,12 @@ All thresholds in `detect_gait_events_foot_based()` are exposed as parameters:
 | `ts_pre_descent_speed` | 200 mm/s | Minimum toe descent speed before TS (swing landing) |
 | `ts_accel_peak_min` | 10000 mm/s² | Minimum impact Az peak for TS |
 | `to_accel_peak_min` | 10000 mm/s² | Minimum push-off Az peak for TO |
+| `flat_foot_toe_heel_mm` | 10 mm | Flat IC if min \|toe−heel\| at IC ± window ≤ this |
+| `flat_foot_ic_check_window_frames` | 3 | ±frames around IC for toe−heel flat check |
+| `flat_foot_vz_prominence` | 80 mm/s | Prominence for downward-Vz peaks in flat IC re-pick |
+| `flat_foot_swing_margin_frames` | 10 | Frames after swing peak before landing search |
+| `flat_foot_landing_max_frames` | 100 | Max frames after swing peak to search for landing |
+| `flat_foot_ground_tolerance_mm` | 60 mm | Relaxed Z cap for near-ground heel Vz+ crossings |
 | `ts_validation_max_gap` | 30 frames | Max frames between TS and paired HS |
 
 ## Project structure

@@ -18,6 +18,7 @@ Per subject: 6 trials per condition x 4 conditions = 24 trials
 
 Output CSVs:
     per_stride_data.csv             : finest granularity, all strides
+    per_step_data.csv               : one row per foot IC (step timing at landing)
     per_trial_phase_summary.csv     : trial x phase x side, mean/SD across strides
     per_trial_obstacle.csv          : per-trial obstacle parameters
     per_subject_summary.csv         : ANOVA-ready, mean/SD across 6 trials
@@ -31,6 +32,14 @@ Conventions:
         length_norm = length_mm / leg_length_mm
         time_norm   = time_s   / sqrt(leg_length_m / g)
         speed_norm  = speed_m_s / sqrt(g * leg_length_m)
+
+Marker / peak-finding notes:
+    - ``_find_peaks_nan_safe`` tolerates short NaN gaps in marker trajectories.
+      Peaks adjacent (±1 frame) to NaN frames are dropped to avoid relying on
+      unreliable heights.
+    - Heel-strike cycle boundaries use either a heel swing peak (height ≥
+      ground + 80 mm) or a toe swing peak (height ≥ ground + 50 mm). This
+      recovers cycles when the heel barely lifts but the toe swings normally.
 """
 
 from __future__ import annotations
@@ -94,6 +103,8 @@ class GaitEvents:
     trail_toe_crossing: Optional[int] = None
     lead_foot_side: Optional[str] = None
     trail_foot_side: Optional[str] = None
+    lead_crossing_marker: Optional[str] = None   # 'toe' or 'heel'
+    trail_crossing_marker: Optional[str] = None  # 'toe' or 'heel'
 
 
 @dataclass
@@ -106,9 +117,12 @@ class StrideRecord:
     to_frame: int
     opp_hs_frame: Optional[int] = None
     opp_to_frame: Optional[int] = None
+    # Frame of the previous opposite-foot IC (for step_time); None if first step in trial
+    prev_opposite_ic_frame: Optional[int] = None
 
     # Strike type at the start of this stride (the IC at hs_start_frame)
     ic_start_strike_type: str = 'unknown'  # 'HS', 'TS', 'MS', or 'unknown'
+    crossing_marker_used: Optional[str] = None  # 'toe' or 'heel'; crossing phases only
 
     # Stride parameters
     stride_time_s: float = float('nan')
@@ -249,10 +263,70 @@ def filter_markers(markers, fs, cutoff=6.0):
 # Walking setup auto-detection
 # =============================================================================
 
+def _remove_marker_outliers(traj, mad_threshold=10.0):
+    """Replace per-axis outlier frames in a marker trajectory with NaN.
+
+    Uses median absolute deviation (MAD) as a robust scale estimate. A frame
+    is rejected on a given axis if its value deviates from the per-axis median
+    by more than mad_threshold * MAD. If any axis is rejected on a frame, all
+    three axes of that frame are set to NaN so the point remains consistent.
+
+    Catches motion-capture artifacts (Vicon mislabels, reconstruction errors)
+    without rejecting legitimate walking translation: real walking excursions
+    stay within ~5 MAD of the trajectory median, while teleport artifacts
+    exceed 100 MAD.
+
+    Parameters
+    ----------
+    traj : np.ndarray, shape (N, 3)
+        Marker trajectory in mm. May contain NaN.
+    mad_threshold : float, default 10.0
+        MAD multiplier above which a sample is rejected.
+
+    Returns
+    -------
+    cleaned : np.ndarray, shape (N, 3)
+        Copy of traj with outlier frames replaced by NaN.
+    n_removed : int
+        Number of frames affected.
+    """
+    cleaned = traj.copy()
+    n = len(traj)
+    bad_frames = np.zeros(n, dtype=bool)
+    for axis in range(3):
+        col = traj[:, axis]
+        valid = ~np.isnan(col)
+        if np.sum(valid) < 10:
+            continue
+        med = np.median(col[valid])
+        mad = np.median(np.abs(col[valid] - med))
+        if mad < 1e-6:
+            mad = 1.0  # degenerate axis; use a small floor
+        bad = np.zeros(n, dtype=bool)
+        bad[valid] = np.abs(col[valid] - med) > mad_threshold * mad
+        bad_frames |= bad
+    cleaned[bad_frames] = np.nan
+    return cleaned, int(np.sum(bad_frames))
+
+
 def determine_setup(markers, obstacle_marker_pair=('OBSTACLE_L', 'OBSTACLE_R'),
                      sampling_rate=100.0):
     lasi = markers.get('LASI')
+    if lasi is not None:
+        lasi, n_lasi = _remove_marker_outliers(lasi)
+        if n_lasi > 0:
+            logger.info(
+                f"determine_setup: removed {n_lasi} outlier frame(s) from LASI"
+            )
+
     rasi = markers.get('RASI')
+    if rasi is not None:
+        rasi, n_rasi = _remove_marker_outliers(rasi)
+        if n_rasi > 0:
+            logger.info(
+                f"determine_setup: removed {n_rasi} outlier frame(s) from RASI"
+            )
+
     if lasi is None or rasi is None:
         raise ValueError("LASI and RASI required")
 
@@ -303,6 +377,22 @@ def determine_setup(markers, obstacle_marker_pair=('OBSTACLE_L', 'OBSTACLE_R'),
 # Foot-based gait event detection (pelvis-independent)
 # =============================================================================
 
+def _dedupe_nearby_ics(ics_with_types, min_gap_frames):
+    """Drop a later IC if it falls within min_gap_frames of the previous (same foot)."""
+    if len(ics_with_types) <= 1:
+        return ics_with_types
+    out = [ics_with_types[0]]
+    for frame, strike in ics_with_types[1:]:
+        prev_frame, prev_strike = out[-1]
+        if frame - prev_frame < min_gap_frames:
+            # Prefer TS over HS; otherwise keep the earlier contact.
+            if strike == 'TS' and prev_strike == 'HS':
+                out[-1] = (frame, strike)
+            continue
+        out.append((frame, strike))
+    return out
+
+
 def detect_gait_events_foot_based(markers, setup, raw_markers=None,
                                      swing_height_above_ground=80,
                                      swing_distance_frames=50,
@@ -317,8 +407,15 @@ def detect_gait_events_foot_based(markers, setup, raw_markers=None,
                                      to_accel_peak_min=10000,
                                      to_min_velocity_at_peak=100,
                                      to_post_rise_frames=10,
-                                     to_post_rise_min=20,
-                                     ts_validation_max_gap=30):
+                                     to_post_rise_min=15,
+                                     flat_foot_toe_heel_mm=10.0,
+                                     flat_foot_ic_check_window_frames=3,
+                                     flat_foot_ground_tolerance_mm=60.0,
+                                     flat_foot_vz_prominence=80.0,
+                                     flat_foot_swing_margin_frames=10,
+                                     flat_foot_landing_max_frames=100,
+                                     ts_validation_max_gap=50,
+                                     preceding_hs_window=5):
     """
     Pelvis-independent gait event detection using Z-minimum priority algorithm.
 
@@ -327,16 +424,19 @@ def detect_gait_events_foot_based(markers, setup, raw_markers=None,
     the sharp transitions characteristic of toe-strike impacts.
 
     HS Detection (per heel swing cycle):
-        Find the DEEPEST Z sign-change (Vz neg→pos) where Z is near ground
-        (≤ground + 40mm). This handles the common biphasic landing where Vz
-        crosses zero twice in one cycle (first at higher Z, then again at the
-        deeper plateau); the deepest crossing is the true HS.
+        Default: DEEPEST Z sign-change (Vz neg→pos) with Z ≤ ground + 40 mm
+        (biphasic heel-rocker: deepest crossing wins over an earlier shallow one).
+
+        Flat-foot refinement (when toe Z is available): after normal deepest-Z
+        HS per cycle, if min |toe−heel| at IC ± ``flat_foot_ic_check_window_frames``
+        is ≤ ``flat_foot_toe_heel_mm`` (default 10 mm), re-pick IC from the
+        strongest heel/toe downward-Vz peaks in the early post-swing window.
 
     TO Detection (per toe swing cycle):
         First positive Az peak (≥10000 mm/s²) where:
         - Vz > 100 mm/s (toe rising rapidly)
         - Z near ground (≤+50mm, toe leaving minimum)
-        - Z continues rising ≥20mm in next 10 frames (sustained swing)
+        - Z continues rising ≥15mm in next 10 frames (sustained swing)
 
     TS Detection (with strict criteria to reject stance-phase artifacts):
         Per cycle in toe Z, find deepest Z sign-change with:
@@ -345,9 +445,15 @@ def detect_gait_events_foot_based(markers, setup, raw_markers=None,
         - Pre-10 frames: all Vz < 0, mean |Vz| ≥ 200 mm/s (real swing descent)
         - Pre-swing peak ≥ ground+50mm (real swing, not stance oscillation)
         - Az peak ≥10000 nearby (impact deceleration)
-        - Validated: same-foot HS must follow within `ts_validation_max_gap`
-          frames; the paired HS is then NOT counted as separate IC (it's the
-          heel-rocker after toe strike, part of same stance).
+        - Validated only if (a) same-foot HS follows within
+          ``ts_validation_max_gap`` frames (default 50 = 500 ms at 100 Hz) AND
+          (b) NO same-foot HS occurred within ``preceding_hs_window`` frames
+          before (default 5 = 50 ms). Condition (b) rejects the toe-down phase
+          of a normal heel-strike landing, which can superficially resemble a
+          toe-strike at the acceleration level. The paired following HS is then
+          NOT counted as separate IC (heel-rocker after toe strike). The 500 ms
+          follow window accommodates slow heel-rocker after toe contact in
+          obstacle crossing.
 
     Args:
         markers: filtered markers dict (used as fallback if raw_markers None)
@@ -381,10 +487,16 @@ def detect_gait_events_foot_based(markers, setup, raw_markers=None,
 
         # Detect HS first (no dependency on TO)
         hs_frames = _detect_heel_strike_zmin(
-            heel_z, fs,
+            heel_z, fs, toe_z=toe_z,
             swing_height=swing_height_above_ground,
             swing_distance=swing_distance_frames,
             ground_tolerance=hs_ground_tolerance_mm,
+            flat_foot_toe_heel_mm=flat_foot_toe_heel_mm,
+            flat_foot_ic_check_window_frames=flat_foot_ic_check_window_frames,
+            flat_foot_ground_tolerance_mm=flat_foot_ground_tolerance_mm,
+            flat_foot_vz_prominence=flat_foot_vz_prominence,
+            flat_foot_swing_margin_frames=flat_foot_swing_margin_frames,
+            flat_foot_landing_max_frames=flat_foot_landing_max_frames,
             min_separation=min_separation_frames,
             pre_descent_frames=pre_descent_frames,
             min_pre_descent_speed=min_hs_pre_descent_speed,
@@ -395,7 +507,6 @@ def detect_gait_events_foot_based(markers, setup, raw_markers=None,
             hs_frames=hs_frames,
             accel_peak_min=to_accel_peak_min,
             min_velocity_at_peak=to_min_velocity_at_peak,
-            ground_tolerance=50,
             post_rise_frames=to_post_rise_frames,
             post_rise_min=to_post_rise_min,
             min_separation=min_separation_frames,
@@ -411,17 +522,56 @@ def detect_gait_events_foot_based(markers, setup, raw_markers=None,
         )
         # Validate TS: must precede same-foot HS within window
         ts_valid, hs_paired_set = _validate_toe_strikes(
-            ts_candidates, hs_frames, max_gap_frames=ts_validation_max_gap)
+            ts_candidates, hs_frames,
+            max_gap_frames=ts_validation_max_gap,
+            preceding_hs_window=preceding_hs_window,
+            heel_z=heel_z,
+            hs_ground_tolerance_mm=hs_ground_tolerance_mm,
+        )
+
+        # Rejected TS with preceding heel contact: promote that heel frame to HS
+        # and suppress the following HS that would have been the TS rocker.
+        supplemental_hs = []
+        suppressed_hs = set()
+        for ts in ts_candidates:
+            if ts in ts_valid:
+                continue
+            prec_hs = [h for h in hs_frames
+                       if ts - preceding_hs_window <= h < ts]
+            if not prec_hs:
+                hf = _find_preceding_heel_strike_frame(
+                    heel_z, ts, preceding_hs_window, hs_ground_tolerance_mm
+                )
+                if hf is not None:
+                    prec_hs = [hf]
+            if not prec_hs:
+                continue
+            sh = int(prec_hs[0])
+            if any(abs(sh - int(h)) < min_separation_frames for h in hs_frames):
+                continue
+            supplemental_hs.append(sh)
+            following = [h for h in hs_frames if ts < h <= ts + ts_validation_max_gap]
+            if following:
+                suppressed_hs.add(following[0])
 
         # Build IC list: TS frames + HS frames not paired-with-TS
         # All ICs get strike type; paired HS are excluded
         ics_with_types = []
+        ic_frames_seen = set()
         for ts in ts_valid:
             ics_with_types.append((ts, 'TS'))
+            ic_frames_seen.add(ts)
         for hs in hs_frames:
-            if hs not in hs_paired_set:
+            if hs not in hs_paired_set and hs not in suppressed_hs and hs not in ic_frames_seen:
                 ics_with_types.append((hs, 'HS'))
+                ic_frames_seen.add(hs)
+        for hs in supplemental_hs:
+            if (hs not in hs_paired_set and hs not in suppressed_hs
+                    and hs not in ic_frames_seen):
+                ics_with_types.append((hs, 'HS'))
+                ic_frames_seen.add(hs)
         ics_with_types.sort(key=lambda x: x[0])
+        ics_with_types = _dedupe_nearby_ics(ics_with_types, min_separation_frames)
 
         for f, t in ics_with_types:
             hs_list.append(int(f))
@@ -443,15 +593,221 @@ def _backward_diff(x, dt):
     return out
 
 
-def _detect_heel_strike_zmin(heel_z, fs, swing_height=80, swing_distance=50,
-                                ground_tolerance=40, min_separation=40,
-                                pre_descent_frames=10, min_pre_descent_speed=30):
-    """
-    HS = deepest Z sign-change (Vz neg→pos) per cycle, Z near ground.
+def _find_peaks_nan_safe(signal, **kwargs):
+    """Wrapper around scipy.signal.find_peaks that tolerates NaN frames.
 
-    Cycle = between consecutive heel swing peaks. The segment before the first
-    swing peak (trial start) is included only if it has a sustained descent
-    (filters trial-start standing transients).
+    NaN frames are replaced with the per-signal 5th-percentile value (a
+    conservative low estimate of the marker's resting level) before peak
+    finding. This prevents scipy from missing peaks adjacent to short NaN
+    gaps. Peaks that fall on a NaN frame or are immediately adjacent (±1
+    frame) to a NaN frame are then dropped, because their height and
+    prominence cannot be trusted.
+
+    Parameters and return values match scipy.signal.find_peaks.
+    """
+    nan_mask = np.isnan(signal)
+    if not nan_mask.any():
+        return find_peaks(signal, **kwargs)
+    valid = signal[~nan_mask]
+    if len(valid) == 0:
+        return np.array([], dtype=int), {}
+    floor = float(np.percentile(valid, 5))
+    filled = np.where(nan_mask, floor, signal)
+    peaks, props = find_peaks(filled, **kwargs)
+    if len(peaks) == 0:
+        return peaks, props
+    # Drop peaks touching NaN frames
+    keep = np.ones(len(peaks), dtype=bool)
+    n = len(signal)
+    for i, p in enumerate(peaks):
+        for off in (-1, 0, 1):
+            j = p + off
+            if 0 <= j < n and nan_mask[j]:
+                keep[i] = False
+                break
+    return peaks[keep], {k: v[keep] for k, v in props.items()
+                            if isinstance(v, np.ndarray) and len(v) == len(peaks)}
+
+
+def _marker_strongest_descent_peak(z, fs, win_start, win_end, *,
+                                    prominence=80.0,
+                                    other_z=None, max_toe_heel_mm=None):
+    """Strongest downward-Vz peak (``find_peaks(-Vz)``) in [win_start, win_end)."""
+    if win_start >= win_end - 1:
+        return None
+    vz = _backward_diff(z, 1 / fs)
+    peaks, _ = _find_peaks_nan_safe(
+        -vz[win_start:win_end], prominence=prominence)
+    if len(peaks) == 0:
+        return None
+    abs_peaks = peaks.astype(int) + win_start
+    if max_toe_heel_mm is not None and other_z is not None:
+        flat_peaks = []
+        for p in abs_peaks:
+            lo = max(0, p - 2)
+            hi = min(len(z), p + 3)
+            diffs = np.abs(z[lo:hi] - other_z[lo:hi])
+            if np.any(np.isfinite(diffs)) and float(np.nanmin(diffs)) <= max_toe_heel_mm:
+                flat_peaks.append(p)
+        if not flat_peaks:
+            return None
+        abs_peaks = flat_peaks
+    return int(min(abs_peaks, key=lambda p: float(vz[p])))
+
+
+def _min_toe_heel_diff_at_frame(heel_z, toe_z, frame, *, window_frames=3):
+    """Min |toe−heel| Z over ``frame ± window_frames`` (inclusive)."""
+    n = len(heel_z)
+    lo = max(0, int(frame) - window_frames)
+    hi = min(n, int(frame) + window_frames + 1)
+    diffs = np.abs(toe_z[lo:hi] - heel_z[lo:hi])
+    if not np.any(np.isfinite(diffs)):
+        return float('inf')
+    return float(np.nanmin(diffs))
+
+
+def _is_flat_foot_at_ic(heel_z, toe_z, ic_frame, *, max_toe_heel_mm=10.0,
+                         ic_check_window_frames=3):
+    """True when min |toe−heel| at the IC (±window) is ≤ threshold."""
+    if max_toe_heel_mm < 0:
+        return False
+    return (_min_toe_heel_diff_at_frame(
+        heel_z, toe_z, ic_frame, window_frames=ic_check_window_frames)
+            <= max_toe_heel_mm)
+
+
+def _heel_swing_cycle_boundaries(heel_z, fs, toe_z=None, *,
+                                  swing_height=80, swing_distance=50,
+                                  toe_swing_height=50, toe_swing_distance=50):
+    """Return ``[(cycle_start, cycle_end), ...]`` from heel/toe swing peaks."""
+    n = len(heel_z)
+    valid = heel_z[~np.isnan(heel_z)]
+    if len(valid) == 0:
+        return []
+    ground_z = float(np.percentile(valid, 5))
+    heel_swing_peaks, _ = _find_peaks_nan_safe(
+        heel_z, height=ground_z + swing_height,
+        distance=swing_distance, prominence=30)
+    swing_peaks = heel_swing_peaks
+    if toe_z is not None:
+        valid_t = toe_z[~np.isnan(toe_z)]
+        if len(valid_t) > 0:
+            ground_toe = float(np.percentile(valid_t, 5))
+            toe_swing_peaks, _ = _find_peaks_nan_safe(
+                toe_z, height=ground_toe + toe_swing_height,
+                distance=toe_swing_distance, prominence=20)
+            low_heel_swing = len(heel_swing_peaks) < len(toe_swing_peaks)
+            first_heel = (int(heel_swing_peaks[0])
+                          if len(heel_swing_peaks) > 0 else None)
+            merged = list(heel_swing_peaks)
+            for tp in toe_swing_peaks:
+                if (first_heel is not None and not low_heel_swing
+                        and int(tp) < first_heel):
+                    continue
+                if not any(abs(int(tp) - int(hp)) < swing_distance
+                              for hp in heel_swing_peaks):
+                    merged.append(int(tp))
+            swing_peaks = np.array(sorted(merged), dtype=int)
+    if len(swing_peaks) == 0:
+        return []
+    bounds = [0] + list(swing_peaks) + [n]
+    return [(bounds[i], bounds[i + 1])
+            for i in range(len(bounds) - 1)]
+
+
+def _cycle_for_frame(cycles, frame):
+    for cycle_start, cycle_end in cycles:
+        if cycle_start <= frame < cycle_end:
+            return cycle_start, cycle_end
+    return None, None
+
+
+def _refine_flat_foot_hs_at_ics(heel_z, toe_z, fs, hs_frames, *,
+                                 flat_foot_toe_heel_mm=10.0,
+                                 flat_foot_ic_check_window_frames=3,
+                                 flat_foot_vz_prominence=80.0,
+                                 flat_foot_swing_margin_frames=10,
+                                 flat_foot_landing_max_frames=100,
+                                 swing_height=80, swing_distance=50,
+                                 toe_swing_height=50, toe_swing_distance=50):
+    """
+    Keep normal HS picks; re-pick with descent-Vz peaks only when the IC is
+    flat-foot at contact (min |toe−heel| at IC ± window ≤ threshold).
+    """
+    if toe_z is None or flat_foot_toe_heel_mm < 0 or not hs_frames:
+        return list(hs_frames)
+    cycles = _heel_swing_cycle_boundaries(
+        heel_z, fs, toe_z=toe_z, swing_height=swing_height,
+        swing_distance=swing_distance,
+        toe_swing_height=toe_swing_height,
+        toe_swing_distance=toe_swing_distance)
+    refined: list[int] = []
+    for hs in hs_frames:
+        if not _is_flat_foot_at_ic(
+                heel_z, toe_z, hs,
+                max_toe_heel_mm=flat_foot_toe_heel_mm,
+                ic_check_window_frames=flat_foot_ic_check_window_frames):
+            refined.append(int(hs))
+            continue
+        cycle_start, cycle_end = _cycle_for_frame(cycles, hs)
+        if cycle_start is None:
+            refined.append(int(hs))
+            continue
+        descent = _pick_flat_foot_ic_from_descent_peaks(
+            heel_z, toe_z, fs, cycle_start, cycle_end,
+            vz_prominence=flat_foot_vz_prominence,
+            swing_margin_frames=flat_foot_swing_margin_frames,
+            landing_max_frames=flat_foot_landing_max_frames,
+            max_toe_heel_mm=flat_foot_toe_heel_mm)
+        refined.append(int(descent) if descent is not None else int(hs))
+    return refined
+
+
+def _pick_flat_foot_ic_from_descent_peaks(heel_z, toe_z, fs, cycle_start,
+                                           cycle_end, *, vz_prominence=80.0,
+                                           swing_margin_frames=10,
+                                           landing_max_frames=100,
+                                           max_toe_heel_mm=10.0):
+    """
+    Flat-foot IC: per marker, strongest descent-Vz peak in the early post-swing
+    window; take the earlier of heel and toe candidates.
+    """
+    win_start = min(cycle_start + swing_margin_frames,
+                    max(cycle_end - 1, cycle_start))
+    win_end = min(cycle_start + landing_max_frames, cycle_end)
+    if win_start >= win_end - 1:
+        return None
+    heel_pick = _marker_strongest_descent_peak(
+        heel_z, fs, win_start, win_end, prominence=vz_prominence,
+        other_z=toe_z, max_toe_heel_mm=max_toe_heel_mm)
+    toe_pick = None
+    if toe_z is not None:
+        toe_pick = _marker_strongest_descent_peak(
+            toe_z, fs, win_start, win_end, prominence=vz_prominence,
+            other_z=heel_z, max_toe_heel_mm=max_toe_heel_mm)
+    candidates = [c for c in (heel_pick, toe_pick) if c is not None]
+    if not candidates:
+        return None
+    return min(candidates)
+
+
+def _detect_heel_strike_zmin(heel_z, fs, toe_z=None, swing_height=80,
+                                swing_distance=50, ground_tolerance=40,
+                                flat_foot_ground_tolerance_mm=60.0,
+                                min_separation=40, pre_descent_frames=10,
+                                min_pre_descent_speed=30,
+                                toe_swing_height=50, toe_swing_distance=50,
+                                flat_foot_toe_heel_mm=10.0,
+                                flat_foot_ic_check_window_frames=3,
+                                flat_foot_vz_prominence=80.0,
+                                flat_foot_swing_margin_frames=10,
+                                flat_foot_landing_max_frames=100):
+    """
+    HS per swing cycle: deepest near-ground heel Vz+ (normal IC).
+
+    When ``toe_z`` is provided, toe-swing peaks supplement heel-swing peaks for
+    cycle boundaries, then each HS is checked for flat-foot contact; flat ICs are
+    refined via ``_refine_flat_foot_hs_at_ics`` (descent-Vz peak re-pick).
     """
     velocity = _backward_diff(heel_z, 1/fs)
     n = len(heel_z)
@@ -460,47 +816,53 @@ def _detect_heel_strike_zmin(heel_z, fs, swing_height=80, swing_distance=50,
         return []
     ground_z = float(np.percentile(valid, 5))
 
-    # Heel swing peaks (high Z = clear swing event)
-    swing_peaks, _ = find_peaks(heel_z, height=ground_z + swing_height,
-                                   distance=swing_distance, prominence=30)
-    if len(swing_peaks) == 0:
+    cycles = _heel_swing_cycle_boundaries(
+        heel_z, fs, toe_z=toe_z, swing_height=swing_height,
+        swing_distance=swing_distance,
+        toe_swing_height=toe_swing_height,
+        toe_swing_distance=toe_swing_distance)
+    if not cycles:
         return []
 
-    # Cycles: include pre-first-peak segment and inter-peak segments
-    boundaries = [0] + list(swing_peaks) + [n]
     strikes = []
-    for i in range(len(boundaries) - 1):
-        cycle_start = boundaries[i]
-        cycle_end = boundaries[i + 1]
+    for i, (cycle_start, cycle_end) in enumerate(cycles):
         is_first_segment = (i == 0)  # before first swing peak
 
-        candidates = []
-        for j in range(max(cycle_start, 1), cycle_end):
-            if np.isnan(velocity[j]) or np.isnan(velocity[j-1]):
-                continue
-            # Sign change: Vz neg → ≥0
-            if velocity[j-1] < 0 and velocity[j] >= 0:
-                # Z near ground
-                if heel_z[j] > ground_z + ground_tolerance:
-                    continue
-                # Trial-start segment: require sustained descent to filter standing
-                if is_first_segment:
-                    if j < pre_descent_frames:
-                        continue
-                    pre = velocity[j - pre_descent_frames:j]
-                    if np.any(np.isnan(pre)):
-                        continue
-                    if np.mean(np.abs(pre)) < min_pre_descent_speed:
-                        continue
-                    if np.sum(pre < 0) < 7:  # at least 7/10 must be negative
-                        continue
-                candidates.append((j, heel_z[j]))
+        def _trial_start_ok(j: int) -> bool:
+            if not is_first_segment:
+                return True
+            if j < pre_descent_frames:
+                return False
+            pre = velocity[j - pre_descent_frames:j]
+            if np.any(np.isnan(pre)):
+                return False
+            if np.mean(np.abs(pre)) < min_pre_descent_speed:
+                return False
+            return np.sum(pre < 0) >= 7
 
-        if not candidates:
+        vz_crossings: list[tuple[int, float, float]] = []
+        for j in range(max(cycle_start, 1), cycle_end):
+            if np.isnan(velocity[j]) or np.isnan(velocity[j - 1]):
+                continue
+            if velocity[j - 1] < 0 and velocity[j] >= 0 and _trial_start_ok(j):
+                toe_heel = 999.0
+                if toe_z is not None and np.isfinite(toe_z[j]):
+                    toe_heel = float(abs(toe_z[j] - heel_z[j]))
+                vz_crossings.append((j, float(heel_z[j]), toe_heel))
+
+        strict = [
+            c for c in vz_crossings if c[1] <= ground_z + ground_tolerance
+        ]
+        relaxed = [
+            c for c in vz_crossings
+            if c[1] <= ground_z + flat_foot_ground_tolerance_mm
+        ]
+        if not strict and not relaxed:
             continue
-        # Pick DEEPEST Z (lowest z value) — primary criterion
-        best = min(candidates, key=lambda c: c[1])
-        strikes.append(best[0])
+
+        pool = strict or relaxed
+        pick = min(pool, key=lambda c: c[1])[0]
+        strikes.append(pick)
 
     # Min separation deduplication
     if len(strikes) > 1:
@@ -509,20 +871,42 @@ def _detect_heel_strike_zmin(heel_z, fs, swing_height=80, swing_distance=50,
             if s - cleaned[-1] >= min_separation:
                 cleaned.append(s)
         strikes = cleaned
+
+    if toe_z is not None:
+        strikes = _refine_flat_foot_hs_at_ics(
+            heel_z, toe_z, fs, strikes,
+            flat_foot_toe_heel_mm=flat_foot_toe_heel_mm,
+            flat_foot_ic_check_window_frames=flat_foot_ic_check_window_frames,
+            flat_foot_vz_prominence=flat_foot_vz_prominence,
+            flat_foot_swing_margin_frames=flat_foot_swing_margin_frames,
+            flat_foot_landing_max_frames=flat_foot_landing_max_frames,
+            swing_height=swing_height, swing_distance=swing_distance,
+            toe_swing_height=toe_swing_height,
+            toe_swing_distance=toe_swing_distance)
+        if len(strikes) > 1:
+            cleaned = [strikes[0]]
+            for s in strikes[1:]:
+                if s - cleaned[-1] >= min_separation:
+                    cleaned.append(s)
+            strikes = cleaned
     return strikes
 
 
 def _detect_toe_off(toe_z, fs, hs_frames=None, accel_peak_min=10000,
-                       min_velocity_at_peak=100, ground_tolerance=50,
-                       post_rise_frames=10, post_rise_min=20,
+                       min_velocity_at_peak=100, ground_tolerance=100,
+                       post_rise_frames=10, post_rise_min=15,
                        min_separation=40):
     """
     TO = first positive Az peak per swing cycle, with sustained motion check.
 
-    If hs_frames is provided, search is bounded by ICs (previous IC to next 
+    If hs_frames is provided, search is bounded by ICs (previous IC to next
     swing peak) — more accurate, as it ignores trial-start transient swings.
-    Otherwise falls back to swing-peak-bounded search (less robust at 
+    Otherwise falls back to swing-peak-bounded search (less robust at
     trial start).
+
+    Az peaks may occur up to ground + 100 mm (post-roll forefoot push-off).
+    Rise is accepted if either the short-window rise (post_rise_frames) meets
+    post_rise_min, or the toe rises at least 50 mm by the upcoming swing peak.
     """
     velocity = _backward_diff(toe_z, 1/fs)
     accel = _backward_diff(velocity, 1/fs)
@@ -532,9 +916,9 @@ def _detect_toe_off(toe_z, fs, hs_frames=None, accel_peak_min=10000,
         return []
     ground_z = float(np.percentile(valid, 5))
 
-    swing_peaks, _ = find_peaks(toe_z, height=ground_z + 30,
-                                   distance=80, prominence=20)
-    az_peaks, _ = find_peaks(accel, height=accel_peak_min, distance=8)
+    swing_peaks, _ = _find_peaks_nan_safe(toe_z, height=ground_z + 30,
+                                             distance=80, prominence=20)
+    az_peaks, _ = _find_peaks_nan_safe(accel, height=accel_peak_min, distance=8)
 
     to_frames = []
     for sp_idx, sp in enumerate(swing_peaks):
@@ -560,18 +944,66 @@ def _detect_toe_off(toe_z, fs, hs_frames=None, accel_peak_min=10000,
         candidates = []
         for ap in az_peaks:
             if look_back <= ap < sp:
-                if not (velocity[ap] > min_velocity_at_peak and
-                         toe_z[ap] <= ground_z + ground_tolerance):
+                if ap < 10:
+                    if (hs_frames is None
+                            or not any(h < 30 for h in hs_frames)):
+                        continue
+                if velocity[ap] <= min_velocity_at_peak:
                     continue
+                # Az peak may occur after the toe has rolled off the ground.
+                if toe_z[ap] > ground_z + 100:
+                    continue
+                # Accept slow risers: short-window rise OR rise to swing peak.
                 check_idx = min(n - 1, ap + post_rise_frames)
-                z_rise = toe_z[check_idx] - toe_z[ap]
-                if z_rise < post_rise_min:
+                z_rise_short = toe_z[check_idx] - toe_z[ap]
+                z_rise_to_peak = toe_z[sp] - toe_z[ap]
+                if z_rise_short < post_rise_min and z_rise_to_peak < 50:
                     continue
                 candidates.append(ap)
         if candidates:
             to_frames.append(min(candidates))  # earliest Az peak in swing
 
     if len(to_frames) > 1:
+        cleaned = [to_frames[0]]
+        for t in to_frames[1:]:
+            if t - cleaned[-1] >= min_separation:
+                cleaned.append(t)
+        to_frames = cleaned
+
+    # Fallback: one TO per HS–HS interval with no toe-off yet (swing-peak
+    # windows often start at the *next* contact, missing push-off before it).
+    if hs_frames is not None and len(hs_frames) >= 2:
+        for i in range(len(hs_frames) - 1):
+            hs_a, hs_b = int(hs_frames[i]), int(hs_frames[i + 1])
+            if any(hs_a < t < hs_b for t in to_frames):
+                continue
+            look_back = hs_a + 5
+            search_end = hs_b
+            candidates = []
+            for ap in az_peaks:
+                if look_back <= ap < search_end:
+                    if ap < 10:
+                        if not any(h < 30 for h in hs_frames):
+                            continue
+                    if velocity[ap] <= min_velocity_at_peak:
+                        continue
+                    if toe_z[ap] > ground_z + 100:
+                        continue
+                    check_idx = min(n - 1, ap + post_rise_frames)
+                    z_rise_short = toe_z[check_idx] - toe_z[ap]
+                    z_rise_to_peak = (
+                        np.nanmax(toe_z[ap:search_end]) - toe_z[ap]
+                        if ap < search_end else 0.0)
+                    if (np.isnan(z_rise_to_peak)
+                            or (z_rise_short < post_rise_min
+                                and z_rise_to_peak < 50)):
+                        continue
+                    candidates.append(ap)
+            if candidates:
+                to_frames.append(min(candidates))
+
+    if len(to_frames) > 1:
+        to_frames = sorted(set(to_frames))
         cleaned = [to_frames[0]]
         for t in to_frames[1:]:
             if t - cleaned[-1] >= min_separation:
@@ -600,8 +1032,8 @@ def _detect_toe_strike_candidates(toe_z, fs, ground_tolerance=20,
         return []
     ground_z = float(np.percentile(valid, 5))
 
-    swing_peaks, _ = find_peaks(toe_z, height=ground_z + 30,
-                                   distance=50, prominence=20)
+    swing_peaks, _ = _find_peaks_nan_safe(toe_z, height=ground_z + 30,
+                                             distance=50, prominence=20)
     if len(swing_peaks) == 0:
         return []
 
@@ -655,16 +1087,63 @@ def _detect_toe_strike_candidates(toe_z, fs, ground_tolerance=20,
     return candidates_out
 
 
-def _validate_toe_strikes(ts_candidates, hs_frames, max_gap_frames=30):
-    """
-    TS valid only if same-foot HS follows within max_gap_frames (heel rocker).
-    The paired HS is excluded from separate IC counting (it's part of TS stance).
+def _find_preceding_heel_strike_frame(heel_z, ts, window, ground_tolerance_mm):
+    """Earliest ground-level heel Vz sign-change in [ts - window, ts], or None."""
+    if heel_z is None or ts < 1:
+        return None
+    valid = heel_z[~np.isnan(heel_z)]
+    if len(valid) == 0:
+        return None
+    ground_z = float(np.percentile(valid, 5))
+    for j in range(max(1, ts - window), ts):
+        if np.isnan(heel_z[j]) or np.isnan(heel_z[j - 1]):
+            continue
+        if j >= 2 and not np.isnan(heel_z[j - 2]):
+            vz_prev = heel_z[j - 1] - heel_z[j - 2]
+        else:
+            vz_prev = 0.0
+        vz = heel_z[j] - heel_z[j - 1]
+        if vz_prev < 0 and vz >= 0 and heel_z[j] <= ground_z + ground_tolerance_mm:
+            return j
+    return None
 
-    Returns (valid_ts_list, paired_hs_set).
+
+def _validate_toe_strikes(ts_candidates, hs_frames, max_gap_frames=50,
+                            preceding_hs_window=5, heel_z=None,
+                            hs_ground_tolerance_mm=40):
+    """TS validation.
+
+    A TS candidate is valid only if BOTH:
+        1. A same-side HS follows within ``max_gap_frames`` frames (heel rocks
+           down after the toe lands — classic toe-strike landing).
+        2. No same-side HS occurred within ``preceding_hs_window`` frames
+           BEFORE the TS candidate. If such a preceding HS exists, the
+           candidate is the toe-down phase of that HS, not a separate TS.
+           Preceding HS is checked against detected ``hs_frames`` and, when
+           ``heel_z`` is supplied, any ground-level heel Vz sign-change in the
+           same window (catches HS contacts missed by cycle-based heel detection).
+
+    Returns
+    -------
+    valid_ts : list of int
+        TS frames that pass both rules.
+    hs_paired : set of int
+        HS frames matched as the rocker following a valid TS (excluded from
+        separate IC counting).
     """
     valid_ts = []
     hs_paired = set()
     for ts in ts_candidates:
+        preceding = [h for h in hs_frames
+                       if ts - preceding_hs_window <= h < ts]
+        if not preceding:
+            heel_frame = _find_preceding_heel_strike_frame(
+                heel_z, ts, preceding_hs_window, hs_ground_tolerance_mm
+            )
+            if heel_frame is not None:
+                preceding = [heel_frame]
+        if preceding:
+            continue
         following = [h for h in hs_frames if ts < h <= ts + max_gap_frames]
         if following:
             valid_ts.append(ts)
@@ -692,9 +1171,7 @@ def detect_obstacle_events(markers, setup, events):
     direction = setup.walking_direction
     obstacle_pos = setup.obstacle_pos_on_axis
 
-    ltoe = markers.get('LTOE')
-    rtoe = markers.get('RTOE')
-    if ltoe is None or rtoe is None:
+    if markers.get('LTOE') is None or markers.get('RTOE') is None:
         return
 
     def first_crossing(traj):
@@ -710,22 +1187,39 @@ def detect_obstacle_events(markers, setup, events):
                     return f + 1
         return None
 
-    ltoe_cross = first_crossing(ltoe)
-    rtoe_cross = first_crossing(rtoe)
+    def crossing_for_side(side):
+        toe_name = 'LTOE' if side == 'left' else 'RTOE'
+        heel_name = 'LHEE' if side == 'left' else 'RHEE'
+        toe = markers.get(toe_name)
+        toe_frame = first_crossing(toe) if toe is not None else None
+        if toe_frame is not None:
+            return toe_frame, 'toe'
+        heel = markers.get(heel_name)
+        heel_frame = first_crossing(heel) if heel is not None else None
+        if heel_frame is not None:
+            logger.warning(
+                f"detect_obstacle_events: {side} toe did not cross obstacle plane; "
+                f"falling back to heel crossing at frame {heel_frame + 1}"
+            )
+            return heel_frame, 'heel'
+        return None, None
+
     cands = []
-    if ltoe_cross is not None:
-        cands.append(('left', ltoe_cross))
-    if rtoe_cross is not None:
-        cands.append(('right', rtoe_cross))
+    for side in ('left', 'right'):
+        frame, marker = crossing_for_side(side)
+        if frame is not None:
+            cands.append((side, frame, marker))
     if not cands:
         logger.warning("No foot crossing detected")
         return
     cands.sort(key=lambda c: c[1])
     events.lead_foot_side = cands[0][0]
     events.lead_toe_crossing = cands[0][1]
+    events.lead_crossing_marker = cands[0][2]
     if len(cands) > 1:
         events.trail_foot_side = cands[1][0]
         events.trail_toe_crossing = cands[1][1]
+        events.trail_crossing_marker = cands[1][2]
 
 
 # =============================================================================
@@ -824,6 +1318,10 @@ def compute_stride_records(markers, events, setup, anthro,
                         opp_heel[hs_start, ml_axis]
                     ))
 
+            prev_ic: Optional[int] = None
+            if prev_opp_hs is not None:
+                prev_ic = int(prev_opp_hs)
+
             stride_length_norm = stride_length / leg_length_mm
             stride_time_norm = stride_time / np.sqrt(leg_length_m / G)
             gait_speed_norm = gait_speed_m_s / np.sqrt(G * leg_length_m)
@@ -843,6 +1341,7 @@ def compute_stride_records(markers, events, setup, anthro,
                 to_frame=int(to_frame),
                 opp_hs_frame=int(opp_hs) if opp_hs is not None else None,
                 opp_to_frame=int(opp_to) if opp_to is not None else None,
+                prev_opposite_ic_frame=prev_ic,
                 ic_start_strike_type=strike_at_start,
                 stride_time_s=round(stride_time, 4),
                 stride_length_mm=round(stride_length, 2),
@@ -898,9 +1397,11 @@ def assign_phases(records, events):
         if r.side == lead_side:
             cross_frame = lead_cross
             crossing_label = 'crossing_lead'
+            crossing_marker = events.lead_crossing_marker
         elif r.side == trail_side:
             cross_frame = trail_cross
             crossing_label = 'crossing_trail'
+            crossing_marker = events.trail_crossing_marker
         else:
             r.phase = 'unknown'
             continue
@@ -911,6 +1412,7 @@ def assign_phases(records, events):
 
         if r.hs_start_frame <= cross_frame <= r.hs_end_frame:
             r.phase = crossing_label
+            r.crossing_marker_used = crossing_marker
         elif r.hs_end_frame < cross_frame:
             r.phase = 'approach'
         else:
@@ -1201,8 +1703,68 @@ def stride_records_to_df(records, metadata):
     df = pd.DataFrame(rows)
     front = ['subject_id', 'group', 'board', 'time', 'trial',
               'stride_idx_in_trial', 'side', 'phase',
+              'ic_start_strike_type', 'crossing_marker_used',
               'hs_start_frame', 'hs_end_frame', 'to_frame',
               'opp_hs_frame', 'opp_to_frame']
+    rest = [c for c in df.columns if c not in front]
+    return df[front + rest]
+
+
+def stride_records_to_per_step_df(records, metadata):
+    """
+    One row per initial contact (IC) at ``hs_start_frame``: step time/length/width
+    from the previous opposite-foot IC (when available).
+    """
+    rows: list[dict[str, Any]] = []
+    for r in records:
+        rows.append(
+            {
+                "subject_id": metadata.subject_id,
+                "group": metadata.group,
+                "board": metadata.board,
+                "time": metadata.time,
+                "trial": metadata.trial,
+                "landing_side": r.side,
+                "ic_frame": int(r.hs_start_frame),
+                "ic_strike_type": r.ic_start_strike_type,
+                "prev_opposite_ic_frame": r.prev_opposite_ic_frame,
+                "step_time_s": r.step_time_s,
+                "step_length_mm": r.step_length_mm,
+                "step_width_mm": r.step_width_mm,
+                "step_length_norm": r.step_length_norm,
+                "step_time_norm": r.step_time_norm,
+                "step_width_norm": r.step_width_norm,
+                "phase": r.phase,
+                "stride_idx_in_trial": int(r.stride_idx_in_trial),
+                "outlier_flag": r.outlier_flag,
+            }
+        )
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    df = df.sort_values("ic_frame", kind="mergesort").reset_index(drop=True)
+    df.insert(5, "step_idx_in_trial", np.arange(len(df), dtype=np.int64))
+    front = [
+        "subject_id",
+        "group",
+        "board",
+        "time",
+        "trial",
+        "step_idx_in_trial",
+        "ic_frame",
+        "landing_side",
+        "ic_strike_type",
+        "prev_opposite_ic_frame",
+        "step_time_s",
+        "step_length_mm",
+        "step_width_mm",
+        "step_length_norm",
+        "step_time_norm",
+        "step_width_norm",
+        "phase",
+        "stride_idx_in_trial",
+        "outlier_flag",
+    ]
     rest = [c for c in df.columns if c not in front]
     return df[front + rest]
 
@@ -1357,6 +1919,7 @@ def analyze_trials(trial_specs, output_dir,
     output_dir.mkdir(parents=True, exist_ok=True)
 
     all_strides = []
+    all_steps = []
     obstacle_rows = []
 
     for spec in trial_specs:
@@ -1378,6 +1941,7 @@ def analyze_trials(trial_specs, output_dir,
             continue
         stride_df = stride_records_to_df(records, spec['metadata'])
         all_strides.append(stride_df)
+        all_steps.append(stride_records_to_per_step_df(records, spec['metadata']))
         obstacle_rows.append(obstacle_to_row(obstacle, spec['metadata'],
                                                 spec['anthropometry'].leg_length_mm))
 
@@ -1385,6 +1949,11 @@ def analyze_trials(trial_specs, output_dir,
                      if all_strides else pd.DataFrame())
     per_stride_path = output_dir / 'per_stride_data.csv'
     per_stride_df.to_csv(per_stride_path, index=False)
+
+    per_step_df = (pd.concat(all_steps, ignore_index=True)
+                   if all_steps else pd.DataFrame())
+    per_step_path = output_dir / 'per_step_data.csv'
+    per_step_df.to_csv(per_step_path, index=False)
 
     per_trial_phase_df = aggregate_per_trial_phase(
         per_stride_df, exclusion_policy=exclusion_policy)
@@ -1409,6 +1978,7 @@ def analyze_trials(trial_specs, output_dir,
 
     return {
         'per_stride': per_stride_path,
+        'per_step': per_step_path,
         'per_trial_phase': per_trial_phase_path,
         'per_trial_obstacle': per_trial_obstacle_path,
         'per_subject': per_subject_path,
@@ -1432,10 +2002,58 @@ def _parse_manifest_trial_cell(value: Any) -> int:
     return int(float(s))
 
 
+def _manifest_first_nonempty(row: "pd.Series", keys: tuple[str, ...], default: str) -> str:
+    """First non-empty cell among optional column names (headers already lowercased)."""
+    for k in keys:
+        if k not in row.index:
+            continue
+        v = row[k]
+        if pd.isna(v):
+            continue
+        s = str(v).strip()
+        if s and s.lower() != "nan":
+            return s
+    return str(default)
+
+
+def _manifest_optional_float(row: "pd.Series", keys: tuple[str, ...]) -> float | None:
+    for k in keys:
+        if k not in row.index:
+            continue
+        v = row[k]
+        if pd.isna(v):
+            continue
+        s = str(v).strip()
+        if not s or s.lower() == "nan":
+            continue
+        try:
+            return float(s)
+        except ValueError:
+            continue
+    return None
+
+
+def _manifest_normalize_group(s: str) -> str:
+    low = str(s).strip().lower()
+    if low in ("adults", "adult"):
+        return "adult"
+    if low in ("children", "child"):
+        return "child"
+    return str(s).strip()
+
+
 def _run_manifest_batch_cli(args: "argparse.Namespace") -> None:
     """
-    CSV manifest: one row per trial (csv_path, trial); shared subject/group/board/time
-    from CLI. Writes the same five aggregate CSVs as the JSON batch spec.
+    CSV manifest: one row per trial. Required columns: ``csv_path`` (or path /
+    input / file) and ``trial`` (or trial_number).
+
+    Optional per-row columns (override CLI defaults when present and non-empty):
+    ``subject_id`` (or ``subject``), ``group``, ``board`` (or ``board_type``),
+    ``time``, ``leg_length_mm`` (or ``leg_length``), ``mass_kg`` (or ``mass``),
+    ``age_years`` (or ``age``), ``height_mm`` (or ``height``).
+
+    If every row supplies ``leg_length_mm`` / ``leg_length``, ``--leg-length-mm``
+    may be omitted. Otherwise ``--leg-length-mm`` is required as the fallback.
 
     The manifest must be a **file path** passed to ``--trial-manifest``; do not paste
     CSV lines into the shell (the shell will try to run them as commands).
@@ -1448,10 +2066,12 @@ def _run_manifest_batch_cli(args: "argparse.Namespace") -> None:
         man = man.rename(columns={"input": "csv_path"})
     if "file" in man.columns and "csv_path" not in man.columns:
         man = man.rename(columns={"file": "csv_path"})
+    if "trial" not in man.columns and "trial_number" in man.columns:
+        man = man.rename(columns={"trial_number": "trial"})
     if "csv_path" not in man.columns or "trial" not in man.columns:
         raise SystemExit(
             "Trial manifest CSV must include columns 'csv_path' and 'trial' "
-            "(aliases: path, input, file for the trajectory path)."
+            "(aliases: path, input, file for the trajectory path; trial_number for trial)."
         )
 
     trial_specs: list[dict[str, Any]] = []
@@ -1466,21 +2086,52 @@ def _run_manifest_batch_cli(args: "argparse.Namespace") -> None:
             trial_num = _parse_manifest_trial_cell(tr)
         except (ValueError, TypeError) as e:
             raise SystemExit(f"Invalid trial value in manifest: {tr!r} ({e})") from e
+
+        leg_mm = _manifest_optional_float(row, ("leg_length_mm", "leg_length"))
+        if leg_mm is None:
+            if args.leg_length_mm is None:
+                raise SystemExit(
+                    "Manifest row missing leg_length_mm (or leg_length); "
+                    "add a column or pass --leg-length-mm as default."
+                )
+            leg_mm = float(args.leg_length_mm)
+
+        sub = _manifest_first_nonempty(row, ("subject_id", "subject"), args.subject_id)
+        grp_raw = _manifest_first_nonempty(row, ("group",), args.group)
+        grp = _manifest_normalize_group(grp_raw)
+        if grp not in ("adult", "child"):
+            raise SystemExit(
+                f"Invalid group {grp_raw!r} (use adult/child or adults/children). "
+                f"Row csv_path={str(p).strip()!r}"
+            )
+        brd = _manifest_first_nonempty(row, ("board", "board_type"), args.board)
+        tm = _manifest_first_nonempty(row, ("time",), args.time)
+
+        mass = _manifest_optional_float(row, ("mass_kg", "mass"))
+        if mass is None and args.mass_kg is not None:
+            mass = float(args.mass_kg)
+        age = _manifest_optional_float(row, ("age_years", "age"))
+        if age is None and args.age_years is not None:
+            age = float(args.age_years)
+        height = _manifest_optional_float(row, ("height_mm", "height"))
+        if height is None and args.height_mm is not None:
+            height = float(args.height_mm)
+
         trial_specs.append(
             {
                 "csv_path": str(p).strip(),
                 "metadata": TrialMetadata(
-                    subject_id=args.subject_id,
-                    group=args.group,
-                    board=args.board,
-                    time=args.time,
+                    subject_id=sub,
+                    group=grp,
+                    board=brd,
+                    time=tm,
                     trial=trial_num,
                 ),
                 "anthropometry": Anthropometry(
-                    leg_length_mm=float(args.leg_length_mm),
-                    mass_kg=args.mass_kg,
-                    age_years=args.age_years,
-                    height_mm=args.height_mm,
+                    leg_length_mm=float(leg_mm),
+                    mass_kg=mass,
+                    age_years=age,
+                    height_mm=height,
                 ),
             }
         )
@@ -1536,6 +2187,16 @@ def _run_single_trial_csv_cli(args: "argparse.Namespace") -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     stride_df.to_csv(out_path, index=False)
     print(f"Wrote per-stride table: {out_path.resolve()}")
+
+    step_path = (
+        Path(args.output_step)
+        if args.output_step is not None
+        else out_path.with_name(f"{out_path.stem}_per_step{out_path.suffix}")
+    )
+    step_path.parent.mkdir(parents=True, exist_ok=True)
+    step_df = stride_records_to_per_step_df(records, metadata)
+    step_df.to_csv(step_path, index=False)
+    print(f"Wrote per-step table: {step_path.resolve()}")
     if args.output_obstacle:
         obs_path = Path(args.output_obstacle)
         obs_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1558,12 +2219,16 @@ def _main():
             --leg-length-mm 850 --subject-id S01 --group adult --board RB \\
             --time pre --trial 1
 
-    3) Same subject / group / board / time, many trials (manifest CSV + output dir)::
+    3) Many trials (manifest CSV + output dir)::
 
         python spatiotemporal.py --trial-manifest trials.csv --output-dir ./out \\
             --leg-length-mm 960 --subject-id BBA01 --group adult --board RB --time pre
 
-        trials.csv columns: csv_path, trial (path aliases: path, input, file).
+        trials.csv: required ``csv_path`` + ``trial`` (aliases: path, input, file;
+        ``trial_number`` for trial). Optional per-row columns override CLI defaults:
+        ``subject_id``, ``group``, ``board``, ``time``, ``leg_length_mm``,
+        ``mass_kg``, ``age_years``, ``height_mm``. If every row has ``leg_length_mm``,
+        ``--leg-length-mm`` may be omitted.
 
     JSON spec shape:
     {
@@ -1616,9 +2281,11 @@ def _main():
         metavar="CSV",
         default=None,
         help=(
-            "Batch: path to a CSV file with columns csv_path and trial (one row per trajectory). "
-            "Create this file in an editor or with a heredoc; do not paste CSV into the shell. "
-            "Use with --output-dir; same --subject-id/--group/--board/--time/--leg-length-mm for all rows."
+            "Batch: path to a CSV with csv_path and trial per row (aliases: path, input, file; "
+            "trial_number for trial). Optional columns subject_id, group, board, time, "
+            "leg_length_mm, mass_kg, age_years, height_mm override CLI defaults when set. "
+            "Omit --leg-length-mm if every row supplies leg_length_mm. "
+            "Use with --output-dir; do not paste CSV into the shell."
         ),
     )
     parser.add_argument(
@@ -1628,16 +2295,23 @@ def _main():
         help="Batch (manifest or JSON): directory for aggregate output CSVs.",
     )
     parser.add_argument(
-        "--output-obstacle",
+        "--output-step",
         metavar="CSV",
         default=None,
-        help="Optional: write one-row per-trial obstacle summary to this CSV.",
+        help=(
+            "Single-trial: per-step CSV path (default: next to --output as "
+            "<output_stem>_per_step.csv)."
+        ),
     )
     parser.add_argument(
         "--leg-length-mm",
         type=float,
         default=None,
-        help="Required with --input: leg length (mm) for normalization.",
+        help=(
+            "Leg length (mm) for normalization. Required with --input/--output. "
+            "With --trial-manifest: required unless every row has leg_length_mm (or leg_length); "
+            "otherwise used as fallback for rows missing that column."
+        ),
     )
     parser.add_argument("--subject-id", default="unknown")
     parser.add_argument("--group", default="adult", choices=("adult", "child"))
@@ -1693,8 +2367,6 @@ def _main():
             parser.error("Do not combine --trial-manifest with --input/--output.")
         if args.output_dir is None:
             parser.error("--output-dir is required with --trial-manifest.")
-        if args.leg_length_mm is None:
-            parser.error("--leg-length-mm is required with --trial-manifest.")
         _run_manifest_batch_cli(args)
         return
 
