@@ -255,11 +255,12 @@ All thresholds in `detect_gait_events_foot_based()` are exposed as parameters:
 | `ts_pre_descent_speed` | 200 mm/s | Minimum toe descent speed before TS (swing landing) |
 | `ts_accel_peak_min` | 10000 mm/s² | Minimum impact Az peak for TS |
 | `to_accel_peak_min` | 10000 mm/s² | Minimum push-off Az peak for TO |
-| `flat_foot_toe_heel_mm` | 10 mm | Flat IC if min \|toe−heel\| at IC ± window ≤ this |
-| `flat_foot_ic_check_window_frames` | 3 | ±frames around IC for toe−heel flat check |
-| `flat_foot_vz_prominence` | 80 mm/s | Prominence for downward-Vz peaks in flat IC re-pick |
+| `flat_foot_toe_heel_mm` | 10 mm | Flat IC if min \|toe−heel\| at IC and preceding frames ≤ this |
+| `flat_foot_ic_pre_check_frames` | 5 | Frames before IC (plus IC) for toe−heel flat check; post-IC excluded |
+| `flat_foot_vz_prominence` | 80 mm/s | Prominence for downward-Vz peaks in flat IC re-pick (latest peak at or after first toe descent) |
 | `flat_foot_swing_margin_frames` | 10 | Frames after swing peak before landing search |
 | `flat_foot_landing_max_frames` | 100 | Max frames after swing peak to search for landing |
+| `flat_foot_heel_lag_frames` | 8 | After last toe descent peak, max frames to include heel descent |
 | `flat_foot_ground_tolerance_mm` | 60 mm | Relaxed Z cap for near-ground heel Vz+ crossings |
 | `ts_validation_max_gap` | 30 frames | Max frames between TS and paired HS |
 
