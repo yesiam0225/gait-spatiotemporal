@@ -1,0 +1,10 @@
+---
+description: Project rules — single source of truth in .rules/
+alwaysApply: true
+---
+
+# Project Rules
+
+All project rules live in **[.rules/](.rules/)**. Read [.rules/README.md](.rules/README.md) first, then the rule file(s) relevant to the task.
+
+Never duplicate rule content in this file or other assistant configs. Edit rules only under `.rules/`.
