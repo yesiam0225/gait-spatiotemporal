@@ -16,7 +16,7 @@ dependencies = [
 ]
 
 [project.scripts]
-spatiotemporal-gait = "spatiotemporal:main"
+spatiotemporal-gait = "spatiotemporal.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/spatiotemporal"]
