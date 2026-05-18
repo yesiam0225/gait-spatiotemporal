@@ -49,8 +49,15 @@ def detect_gait_events_foot_based(markers, setup, raw_markers=None,
                                      flat_foot_swing_margin_frames=10,
                                      flat_foot_landing_max_frames=100,
                                      flat_foot_heel_lag_frames=8,
+                                     flat_foot_post_hs_plateau_vz_mm_s=10.0,
+                                     flat_foot_post_hs_plateau_frames=10,
                                      ts_validation_max_gap=50,
-                                     preceding_hs_window=5):
+                                     preceding_hs_window=5,
+                                     ts_post_ground_hold_enabled=True,
+                                     ts_post_ground_tolerance_mm=20.0,
+                                     ts_post_ground_min_frames=8,
+                                     ts_post_max_early_rise_mm=8.0,
+                                     ts_post_early_rise_frames=8):
     """
     Pelvis-independent gait event detection using Z-minimum priority algorithm.
 
@@ -62,12 +69,18 @@ def detect_gait_events_foot_based(markers, setup, raw_markers=None,
         Default: DEEPEST Z sign-change (Vz neg→pos) with Z ≤ ground + 40 mm
         (biphasic heel-rocker: deepest crossing wins over an earlier shallow one).
 
-        Flat-foot refinement (when toe Z is available): after normal deepest-Z
-        HS per cycle, if min |toe−heel| over IC and the preceding
-        ``flat_foot_ic_pre_check_frames`` (default 5) is ≤ ``flat_foot_toe_heel_mm``
-        (default 10 mm), re-pick IC from descent-Vz
-        peaks between toe and heel (latest peak from first toe descent through
-        ``flat_foot_heel_lag_frames`` after the last toe peak).
+        Flat-foot refinement (when toe Z is available): after normal HS per cycle,
+        if min |toe−heel| over IC and the preceding ``flat_foot_ic_pre_check_frames``
+        (default 5) is ≤ ``flat_foot_toe_heel_mm`` (default 10 mm), re-pick IC from
+        descent-Vz peaks when (a) post-IC |heel Vz| shows an extended small-velocity
+        plateau (≥ ``flat_foot_post_hs_plateau_frames`` consecutive post-IC frames
+        with ``-flat_foot_post_hs_plateau_vz_mm_s ≤ heel Vz ≤ 0``, default
+        −10–0 mm/s for 10 frames; positive small heel Vz does not count), OR
+        (b) the descent peak lies earlier than the zmin HS (flat-foot landing before
+        the deepest heel-rocker crossing). Later-only descent peaks without a plateau
+        are not applied (heel-first rocker). When multiple near-ground Vz+ crossings
+        exist and the deepest lacks a plateau, the first crossing is used if it is
+        flat-foot at contact.
 
     TO Detection (per toe swing cycle):
         First positive Az peak (≥10000 mm/s²) where:
@@ -82,10 +95,15 @@ def detect_gait_events_foot_based(markers, setup, raw_markers=None,
         - Pre-10 frames: all Vz < 0, mean |Vz| ≥ 200 mm/s (real swing descent)
         - Pre-swing peak ≥ ground+50mm (real swing, not stance oscillation)
         - Az peak ≥10000 nearby (impact deceleration)
-        - Validated only if (a) same-foot HS follows within
-          ``ts_validation_max_gap`` frames (default 50 = 500 ms at 100 Hz) AND
-          (b) NO same-foot HS occurred within ``preceding_hs_window`` frames
-          before (default 5 = 50 ms). Condition (b) rejects the toe-down phase
+        - Validated against **pre-flat-foot-refine** HS frames so
+          ``earlier_descent`` does not create a false preceding HS that blocks a
+          toe-Az TS (e.g. TS at clearance minimum before the heel rocker).
+          Requires (a) same-foot HS (pre-refine) follows within
+          ``ts_validation_max_gap`` frames (default 50 = 500 ms at 100 Hz),
+          (b) NO same-foot pre-refine HS within ``preceding_hs_window`` frames
+          before (default 5 = 50 ms), and (c) when enabled, the toe stays near
+          ground after the candidate without an immediate rise (rejects clearance
+          dips). Condition (b) rejects the toe-down phase
           of a normal heel-strike landing, which can superficially resemble a
           toe-strike at the acceleration level. The paired following HS is then
           NOT counted as separate IC (heel-rocker after toe strike). The 500 ms
@@ -122,9 +140,8 @@ def detect_gait_events_foot_based(markers, setup, raw_markers=None,
         heel_z = heel[:, 2]
         toe_z = toe[:, 2]
 
-        # Detect HS first (no dependency on TO)
-        hs_frames = _detect_heel_strike_zmin(
-            heel_z, fs, toe_z=toe_z,
+        # HS: raw picks first; flat-foot refine applied after TS validation.
+        hs_kw = dict(
             swing_height=swing_height_above_ground,
             swing_distance=swing_distance_frames,
             ground_tolerance=hs_ground_tolerance_mm,
@@ -135,10 +152,37 @@ def detect_gait_events_foot_based(markers, setup, raw_markers=None,
             flat_foot_swing_margin_frames=flat_foot_swing_margin_frames,
             flat_foot_landing_max_frames=flat_foot_landing_max_frames,
             flat_foot_heel_lag_frames=flat_foot_heel_lag_frames,
+            flat_foot_post_hs_plateau_vz_mm_s=flat_foot_post_hs_plateau_vz_mm_s,
+            flat_foot_post_hs_plateau_frames=flat_foot_post_hs_plateau_frames,
             min_separation=min_separation_frames,
             pre_descent_frames=pre_descent_frames,
             min_pre_descent_speed=min_hs_pre_descent_speed,
         )
+        hs_raw = _detect_heel_strike_raw(heel_z, fs, toe_z=toe_z, **hs_kw)
+        hs_frames = (
+            _refine_flat_foot_hs_at_ics(
+                heel_z, toe_z, fs, hs_raw,
+                flat_foot_toe_heel_mm=flat_foot_toe_heel_mm,
+                flat_foot_ic_pre_check_frames=flat_foot_ic_pre_check_frames,
+                flat_foot_vz_prominence=flat_foot_vz_prominence,
+                flat_foot_swing_margin_frames=flat_foot_swing_margin_frames,
+                flat_foot_landing_max_frames=flat_foot_landing_max_frames,
+                flat_foot_heel_lag_frames=flat_foot_heel_lag_frames,
+                flat_foot_post_hs_plateau_vz_mm_s=flat_foot_post_hs_plateau_vz_mm_s,
+                flat_foot_post_hs_plateau_frames=flat_foot_post_hs_plateau_frames,
+                swing_height=swing_height_above_ground,
+                swing_distance=swing_distance_frames,
+                toe_swing_height=50,
+                toe_swing_distance=50,
+            )
+            if toe_z is not None else list(hs_raw)
+        )
+        if toe_z is not None and len(hs_frames) > 1:
+            cleaned = [hs_frames[0]]
+            for s in hs_frames[1:]:
+                if s - cleaned[-1] >= min_separation_frames:
+                    cleaned.append(s)
+            hs_frames = cleaned
         # TO detection uses HS-bounded search (more accurate at trial start)
         to_frames = _detect_toe_off(
             toe_z, fs,
@@ -158,13 +202,25 @@ def detect_gait_events_foot_based(markers, setup, raw_markers=None,
             accel_peak_min=ts_accel_peak_min,
             min_separation=min_separation_frames,
         )
-        # Validate TS: must precede same-foot HS within window
+        # Validate TS against pre-refine HS (toe-Az minimum before heel rocker).
         ts_valid, hs_paired_set = _validate_toe_strikes(
-            ts_candidates, hs_frames,
+            ts_candidates, hs_raw,
             max_gap_frames=ts_validation_max_gap,
             preceding_hs_window=preceding_hs_window,
             heel_z=heel_z,
+            toe_z=toe_z,
+            fs=fs,
             hs_ground_tolerance_mm=hs_ground_tolerance_mm,
+            post_ground_hold_enabled=ts_post_ground_hold_enabled,
+            post_ground_tolerance_mm=ts_post_ground_tolerance_mm,
+            post_ground_min_frames=ts_post_ground_min_frames,
+            post_max_early_rise_mm=ts_post_max_early_rise_mm,
+            post_early_rise_frames=ts_post_early_rise_frames,
+        )
+        hs_blocked_by_ts = _hs_refine_suppressed_by_valid_ts(
+            ts_valid, hs_paired_set, hs_raw, hs_frames,
+            ts_validation_max_gap=ts_validation_max_gap,
+            preceding_hs_window=preceding_hs_window,
         )
 
         # Rejected TS with preceding heel contact: promote that heel frame to HS
@@ -174,7 +230,7 @@ def detect_gait_events_foot_based(markers, setup, raw_markers=None,
         for ts in ts_candidates:
             if ts in ts_valid:
                 continue
-            prec_hs = [h for h in hs_frames
+            prec_hs = [h for h in hs_raw
                        if ts - preceding_hs_window <= h < ts]
             if not prec_hs:
                 hf = _find_preceding_heel_strike_frame(
@@ -185,10 +241,10 @@ def detect_gait_events_foot_based(markers, setup, raw_markers=None,
             if not prec_hs:
                 continue
             sh = int(prec_hs[0])
-            if any(abs(sh - int(h)) < min_separation_frames for h in hs_frames):
+            if any(abs(sh - int(h)) < min_separation_frames for h in hs_raw):
                 continue
             supplemental_hs.append(sh)
-            following = [h for h in hs_frames if ts < h <= ts + ts_validation_max_gap]
+            following = [h for h in hs_raw if ts < h <= ts + ts_validation_max_gap]
             if following:
                 suppressed_hs.add(following[0])
 
@@ -200,7 +256,8 @@ def detect_gait_events_foot_based(markers, setup, raw_markers=None,
             ics_with_types.append((ts, 'TS'))
             ic_frames_seen.add(ts)
         for hs in hs_frames:
-            if hs not in hs_paired_set and hs not in suppressed_hs and hs not in ic_frames_seen:
+            if (hs not in hs_paired_set and hs not in suppressed_hs
+                    and hs not in hs_blocked_by_ts and hs not in ic_frames_seen):
                 ics_with_types.append((hs, 'HS'))
                 ic_frames_seen.add(hs)
         for hs in supplemental_hs:
@@ -329,6 +386,70 @@ def _is_flat_foot_at_ic(heel_z, toe_z, ic_frame, *, max_toe_heel_mm=10.0,
             <= max_toe_heel_mm)
 
 
+def _has_post_hs_small_vz_plateau(heel_z, fs, ic_frame, *,
+                                   max_abs_vz_mm_s=10.0,
+                                   min_consecutive_frames=10,
+                                   search_frames=40):
+    """True when heel Vz stays in [-max, 0] mm/s for N consecutive post-IC frames.
+
+  Searches post-IC heel velocity (frames ic_frame+1 …) for at least
+  ``min_consecutive_frames`` consecutive samples with
+  ``-max_abs_vz_mm_s ≤ Vz ≤ 0`` (excludes small positive rocker rise).
+    """
+    if min_consecutive_frames <= 0 or max_abs_vz_mm_s < 0:
+        return False
+    vz = _backward_diff(heel_z, 1 / fs)
+    start = int(ic_frame) + 1
+    end = min(len(vz), start + search_frames)
+    if start >= end:
+        return False
+    run = 0
+    for j in range(start, end):
+        v = vz[j]
+        if np.isfinite(v) and (-max_abs_vz_mm_s <= float(v) <= 0.0):
+            run += 1
+            if run >= min_consecutive_frames:
+                return True
+        else:
+            run = 0
+    return False
+
+
+def _toe_holds_ground_after_ts(toe_z, fs, ts_frame, *,
+                               ground_tolerance_mm=20.0,
+                               min_near_ground_frames=8,
+                               max_early_rise_mm=8.0,
+                               early_rise_frames=8):
+    """True when toe stays near ground after TS without an immediate clearance rise."""
+    if early_rise_frames <= 0 or min_near_ground_frames <= 0:
+        return True
+    valid = toe_z[~np.isnan(toe_z)]
+    if len(valid) == 0:
+        return False
+    ground_z = float(np.percentile(valid, 5))
+    n = len(toe_z)
+    z0 = toe_z[int(ts_frame)]
+    if not np.isfinite(z0):
+        return False
+    rise_end = min(n, int(ts_frame) + 1 + early_rise_frames)
+    for j in range(int(ts_frame) + 1, rise_end):
+        if not np.isfinite(toe_z[j]):
+            return False
+        if float(toe_z[j]) - float(z0) > max_early_rise_mm:
+            return False
+    start = int(ts_frame) + 1
+    search_end = min(n, start + min_near_ground_frames + 20)
+    run = 0
+    for j in range(start, search_end):
+        if np.isfinite(toe_z[j]) and float(toe_z[j]) <= ground_z + ground_tolerance_mm:
+            run += 1
+            if run >= min_near_ground_frames:
+                return True
+        else:
+            run = 0
+    return False
+
+
 def _heel_swing_cycle_boundaries(heel_z, fs, toe_z=None, *,
                                   swing_height=80, swing_distance=50,
                                   toe_swing_height=50, toe_swing_distance=50):
@@ -382,11 +503,13 @@ def _refine_flat_foot_hs_at_ics(heel_z, toe_z, fs, hs_frames, *,
                                  flat_foot_swing_margin_frames=10,
                                  flat_foot_landing_max_frames=100,
                                  flat_foot_heel_lag_frames=8,
+                                 flat_foot_post_hs_plateau_vz_mm_s=10.0,
+                                 flat_foot_post_hs_plateau_frames=10,
                                  swing_height=80, swing_distance=50,
                                  toe_swing_height=50, toe_swing_distance=50):
     """
-    Keep normal HS picks; re-pick with descent-Vz peaks only when the IC is
-    flat-foot at contact (min |toe−heel| at IC and preceding frames ≤ threshold).
+    Keep normal HS picks; re-pick with descent-Vz peaks when the IC is flat-foot
+    at contact and either post-IC small-|Vz| plateau or an earlier descent peak.
     """
     if toe_z is None or flat_foot_toe_heel_mm < 0 or not hs_frames:
         return list(hs_frames)
@@ -414,7 +537,15 @@ def _refine_flat_foot_hs_at_ics(heel_z, toe_z, fs, hs_frames, *,
             landing_max_frames=flat_foot_landing_max_frames,
             max_toe_heel_mm=flat_foot_toe_heel_mm,
             heel_lag_frames=flat_foot_heel_lag_frames)
-        refined.append(int(descent) if descent is not None else int(hs))
+        has_plateau = _has_post_hs_small_vz_plateau(
+            heel_z, fs, hs,
+            max_abs_vz_mm_s=flat_foot_post_hs_plateau_vz_mm_s,
+            min_consecutive_frames=flat_foot_post_hs_plateau_frames)
+        earlier_descent = descent is not None and int(descent) < int(hs)
+        if descent is not None and (has_plateau or earlier_descent):
+            refined.append(int(descent))
+        else:
+            refined.append(int(hs))
     return refined
 
 
@@ -456,25 +587,50 @@ def _pick_flat_foot_ic_from_descent_peaks(heel_z, toe_z, fs, cycle_start,
     return int(between[-1])
 
 
-def _detect_heel_strike_zmin(heel_z, fs, toe_z=None, swing_height=80,
-                                swing_distance=50, ground_tolerance=40,
-                                flat_foot_ground_tolerance_mm=60.0,
-                                min_separation=40, pre_descent_frames=10,
-                                min_pre_descent_speed=30,
-                                toe_swing_height=50, toe_swing_distance=50,
-                                flat_foot_toe_heel_mm=10.0,
-                                flat_foot_ic_pre_check_frames=5,
-                                flat_foot_vz_prominence=80.0,
-                                flat_foot_swing_margin_frames=10,
-                                flat_foot_landing_max_frames=100,
-                                flat_foot_heel_lag_frames=8):
-    """
-    HS per swing cycle: deepest near-ground heel Vz+ (normal IC).
+def _hs_refine_suppressed_by_valid_ts(ts_valid, hs_paired_set, hs_raw, hs_refined,
+                                       *, ts_validation_max_gap=50,
+                                       preceding_hs_window=5):
+    """Suppress earlier-descent HS only for the landing paired with a valid TS.
 
-    When ``toe_z`` is provided, toe-swing peaks supplement heel-swing peaks for
-    cycle boundaries, then each HS is checked for flat-foot contact; flat ICs are
-    refined via ``_refine_flat_foot_hs_at_ics`` (descent-Vz peak re-pick).
+    Only the refined frame that replaced the rocker HS (same index in raw/refine
+    lists) is suppressed—not unrelated earlier HS in the trial.
     """
+    del preceding_hs_window  # kept for API stability
+    suppressed: set[int] = set()
+    if not ts_valid or len(hs_raw) != len(hs_refined):
+        return suppressed
+    hs_raw_set = {int(h) for h in hs_raw}
+    for ts in ts_valid:
+        following = sorted(
+            h for h in hs_raw_set
+            if int(ts) < h <= int(ts) + ts_validation_max_gap)
+        if not following:
+            continue
+        paired = following[0]
+        for raw_hs, ref_hs in zip(hs_raw, hs_refined):
+            raw_i, ref_i = int(raw_hs), int(ref_hs)
+            if ref_i == raw_i or raw_i != paired:
+                continue
+            if ref_i < raw_i:
+                suppressed.add(ref_i)
+    return suppressed
+
+
+def _detect_heel_strike_raw(heel_z, fs, toe_z=None, swing_height=80,
+                               swing_distance=50, ground_tolerance=40,
+                               flat_foot_ground_tolerance_mm=60.0,
+                               min_separation=40, pre_descent_frames=10,
+                               min_pre_descent_speed=30,
+                               toe_swing_height=50, toe_swing_distance=50,
+                               flat_foot_toe_heel_mm=10.0,
+                               flat_foot_ic_pre_check_frames=5,
+                               flat_foot_vz_prominence=80.0,
+                               flat_foot_swing_margin_frames=10,
+                               flat_foot_landing_max_frames=100,
+                               flat_foot_heel_lag_frames=8,
+                               flat_foot_post_hs_plateau_vz_mm_s=10.0,
+                               flat_foot_post_hs_plateau_frames=10):
+    """HS per swing cycle before flat-foot refinement (used for TS validation)."""
     velocity = _backward_diff(heel_z, 1/fs)
     n = len(heel_z)
     valid = heel_z[~np.isnan(heel_z)]
@@ -527,7 +683,23 @@ def _detect_heel_strike_zmin(heel_z, fs, toe_z=None, swing_height=80,
             continue
 
         pool = strict or relaxed
-        pick = min(pool, key=lambda c: c[1])[0]
+        deepest_pick = min(pool, key=lambda c: c[1])[0]
+        if (len(pool) >= 2 and toe_z is not None):
+            first_pick = min(pool, key=lambda c: c[0])[0]
+            if (first_pick != deepest_pick
+                    and _is_flat_foot_at_ic(
+                        heel_z, toe_z, first_pick,
+                        max_toe_heel_mm=flat_foot_toe_heel_mm,
+                        ic_pre_check_frames=flat_foot_ic_pre_check_frames)
+                    and not _has_post_hs_small_vz_plateau(
+                        heel_z, fs, deepest_pick,
+                        max_abs_vz_mm_s=flat_foot_post_hs_plateau_vz_mm_s,
+                        min_consecutive_frames=flat_foot_post_hs_plateau_frames)):
+                pick = first_pick
+            else:
+                pick = deepest_pick
+        else:
+            pick = deepest_pick
         strikes.append(pick)
 
     # Min separation deduplication
@@ -538,6 +710,45 @@ def _detect_heel_strike_zmin(heel_z, fs, toe_z=None, swing_height=80,
                 cleaned.append(s)
         strikes = cleaned
 
+    return strikes
+
+
+def _detect_heel_strike_zmin(heel_z, fs, toe_z=None, swing_height=80,
+                                swing_distance=50, ground_tolerance=40,
+                                flat_foot_ground_tolerance_mm=60.0,
+                                min_separation=40, pre_descent_frames=10,
+                                min_pre_descent_speed=30,
+                                toe_swing_height=50, toe_swing_distance=50,
+                                flat_foot_toe_heel_mm=10.0,
+                                flat_foot_ic_pre_check_frames=5,
+                                flat_foot_vz_prominence=80.0,
+                                flat_foot_swing_margin_frames=10,
+                                flat_foot_landing_max_frames=100,
+                                flat_foot_heel_lag_frames=8,
+                                flat_foot_post_hs_plateau_vz_mm_s=10.0,
+                                flat_foot_post_hs_plateau_frames=10):
+    """
+    HS per swing cycle: deepest near-ground heel Vz+ (normal IC).
+
+    When ``toe_z`` is provided, applies ``_refine_flat_foot_hs_at_ics`` after
+    raw cycle picks (see ``_detect_heel_strike_raw``).
+    """
+    strikes = _detect_heel_strike_raw(
+        heel_z, fs, toe_z=toe_z, swing_height=swing_height,
+        swing_distance=swing_distance, ground_tolerance=ground_tolerance,
+        flat_foot_ground_tolerance_mm=flat_foot_ground_tolerance_mm,
+        min_separation=min_separation, pre_descent_frames=pre_descent_frames,
+        min_pre_descent_speed=min_pre_descent_speed,
+        toe_swing_height=toe_swing_height, toe_swing_distance=toe_swing_distance,
+        flat_foot_toe_heel_mm=flat_foot_toe_heel_mm,
+        flat_foot_ic_pre_check_frames=flat_foot_ic_pre_check_frames,
+        flat_foot_vz_prominence=flat_foot_vz_prominence,
+        flat_foot_swing_margin_frames=flat_foot_swing_margin_frames,
+        flat_foot_landing_max_frames=flat_foot_landing_max_frames,
+        flat_foot_heel_lag_frames=flat_foot_heel_lag_frames,
+        flat_foot_post_hs_plateau_vz_mm_s=flat_foot_post_hs_plateau_vz_mm_s,
+        flat_foot_post_hs_plateau_frames=flat_foot_post_hs_plateau_frames,
+    )
     if toe_z is not None:
         strikes = _refine_flat_foot_hs_at_ics(
             heel_z, toe_z, fs, strikes,
@@ -547,6 +758,8 @@ def _detect_heel_strike_zmin(heel_z, fs, toe_z=None, swing_height=80,
             flat_foot_swing_margin_frames=flat_foot_swing_margin_frames,
             flat_foot_landing_max_frames=flat_foot_landing_max_frames,
             flat_foot_heel_lag_frames=flat_foot_heel_lag_frames,
+            flat_foot_post_hs_plateau_vz_mm_s=flat_foot_post_hs_plateau_vz_mm_s,
+            flat_foot_post_hs_plateau_frames=flat_foot_post_hs_plateau_frames,
             swing_height=swing_height, swing_distance=swing_distance,
             toe_swing_height=toe_swing_height,
             toe_swing_distance=toe_swing_distance)
@@ -776,11 +989,16 @@ def _find_preceding_heel_strike_frame(heel_z, ts, window, ground_tolerance_mm):
 
 
 def _validate_toe_strikes(ts_candidates, hs_frames, max_gap_frames=50,
-                            preceding_hs_window=5, heel_z=None,
-                            hs_ground_tolerance_mm=40):
+                            preceding_hs_window=5, heel_z=None, toe_z=None,
+                            fs=100.0, hs_ground_tolerance_mm=40,
+                            post_ground_hold_enabled=False,
+                            post_ground_tolerance_mm=20.0,
+                            post_ground_min_frames=8,
+                            post_max_early_rise_mm=8.0,
+                            post_early_rise_frames=8):
     """TS validation.
 
-    A TS candidate is valid only if BOTH:
+    A TS candidate is valid only if ALL of:
         1. A same-side HS follows within ``max_gap_frames`` frames (heel rocks
            down after the toe lands — classic toe-strike landing).
         2. No same-side HS occurred within ``preceding_hs_window`` frames
@@ -789,11 +1007,13 @@ def _validate_toe_strikes(ts_candidates, hs_frames, max_gap_frames=50,
            Preceding HS is checked against detected ``hs_frames`` and, when
            ``heel_z`` is supplied, any ground-level heel Vz sign-change in the
            same window (catches HS contacts missed by cycle-based heel detection).
+        3. When ``post_ground_hold_enabled`` and ``toe_z`` are set, the toe
+           remains near ground after the candidate without an immediate rise.
 
     Returns
     -------
     valid_ts : list of int
-        TS frames that pass both rules.
+        TS frames that pass all rules.
     hs_paired : set of int
         HS frames matched as the rocker following a valid TS (excluded from
         separate IC counting).
@@ -812,9 +1032,18 @@ def _validate_toe_strikes(ts_candidates, hs_frames, max_gap_frames=50,
         if preceding:
             continue
         following = [h for h in hs_frames if ts < h <= ts + max_gap_frames]
-        if following:
-            valid_ts.append(ts)
-            hs_paired.add(following[0])
+        if not following:
+            continue
+        if (post_ground_hold_enabled and toe_z is not None and
+                not _toe_holds_ground_after_ts(
+                    toe_z, fs, ts,
+                    ground_tolerance_mm=post_ground_tolerance_mm,
+                    min_near_ground_frames=post_ground_min_frames,
+                    max_early_rise_mm=post_max_early_rise_mm,
+                    early_rise_frames=post_early_rise_frames)):
+            continue
+        valid_ts.append(ts)
+        hs_paired.add(following[0])
     return valid_ts, hs_paired
 
 
