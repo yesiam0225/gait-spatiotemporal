@@ -261,6 +261,8 @@ All thresholds in `detect_gait_events_foot_based()` are exposed as parameters:
 | `flat_foot_swing_margin_frames` | 10 | Frames after swing peak before landing search |
 | `flat_foot_landing_max_frames` | 100 | Max frames after swing peak to search for landing |
 | `flat_foot_heel_lag_frames` | 8 | After last toe descent peak, max frames to include heel descent |
+| `flat_foot_post_hs_plateau_vz_mm_s` | 10 mm/s | Post-IC \|heel Vz\| must stay below this for plateau check |
+| `flat_foot_post_hs_plateau_frames` | 10 | Consecutive post-IC frames below plateau Vz required to allow flat re-pick (or use earlier descent peak) |
 | `flat_foot_ground_tolerance_mm` | 60 mm | Relaxed Z cap for near-ground heel Vz+ crossings |
 | `ts_validation_max_gap` | 30 frames | Max frames between TS and paired HS |
 
