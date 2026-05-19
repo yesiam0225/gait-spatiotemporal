@@ -252,9 +252,13 @@ All thresholds in `detect_gait_events_foot_based()` are exposed as parameters:
 | `ts_ground_tolerance_mm` | 20 mm | TS Z must be within this of ground (stricter) |
 | `ts_pre_swing_min_height` | 50 mm | Real toe swing must reach this height before TS |
 | `min_hs_pre_descent_speed` | 30 mm/s | Minimum heel descent speed before HS |
-| `ts_pre_descent_speed` | 200 mm/s | Minimum toe descent speed before TS (swing landing) |
+| `ts_pre_descent_frames` | 5 | Lookback window before TS for descent Vz check |
+| `ts_pre_descent_min_negative_hits` | 3 | Minimum frames with Vz < 0 in that window (3-of-5) |
+| `ts_pre_descent_speed` | 200 mm/s | Mean \|Vz\| over that window before TS (swing landing) |
 | `ts_accel_peak_min` | 10000 mm/s² | Minimum impact Az peak for TS |
 | `to_accel_peak_min` | 10000 mm/s² | Minimum push-off Az peak for TO |
+| `max_early_az_frame` | 10 (Vicon frame) | Skip early transient Az peaks when Vicon frame &lt; this and a same-foot HS occurred before frame 30 |
+| `max_early_hs_frame` | 30 (Vicon frame) | Paired with `max_early_az_frame` for the early-TO guard (requires `frame_labels` from CSV) |
 | `flat_foot_toe_heel_mm` | 10 mm | Flat IC if min \|toe−heel\| at IC and preceding frames ≤ this |
 | `flat_foot_ic_pre_check_frames` | 5 | Frames before IC (plus IC) for toe−heel flat check; post-IC excluded |
 | `flat_foot_vz_prominence` | 80 mm/s | Prominence for downward-Vz peaks in flat IC re-pick (latest peak at or after first toe descent) |

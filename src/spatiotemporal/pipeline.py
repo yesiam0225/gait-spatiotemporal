@@ -33,7 +33,7 @@ def analyze_trial(csv_path, metadata, anthro,
                     sampling_rate=100.0, filter_cutoff=6.0, apply_filter=True,
                     outlier_iqr_threshold=1.5, outlier_min_strides=5,
                     physiological_bounds=None):
-    df, col_map, _ = load_marker_csv(csv_path)
+    df, col_map, frame_labels = load_marker_csv(csv_path)
     markers_raw = {}
     for name in col_map.keys():
         t = get_traj(df, col_map, name)
@@ -51,8 +51,8 @@ def analyze_trial(csv_path, metadata, anthro,
 
     # Event detection uses RAW markers (more accurate timing of events,
     # esp. toe-strike impacts which have sharp Vz transitions filter blurs).
-    events = detect_gait_events_foot_based(markers, setup,
-                                              raw_markers=markers_raw)
+    events = detect_gait_events_foot_based(
+        markers, setup, raw_markers=markers_raw, frame_labels=frame_labels)
     detect_obstacle_events(markers, setup, events)
 
     records = compute_stride_records(markers, events, setup, anthro)
