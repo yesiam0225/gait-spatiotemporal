@@ -259,8 +259,10 @@ All thresholds in `detect_gait_events_foot_based()` are exposed as parameters:
 | `to_accel_peak_min` | 10000 mm/s² | Minimum push-off Az peak for TO |
 | `max_early_az_frame` | 10 (Vicon frame) | Skip early transient Az peaks when Vicon frame &lt; this and a same-foot HS occurred before frame 30 |
 | `max_early_hs_frame` | 30 (Vicon frame) | Paired with `max_early_az_frame` for the early-TO guard (requires `frame_labels` from CSV) |
-| `flat_foot_toe_heel_mm` | 10 mm | Flat IC if min \|toe−heel\| at IC and preceding frames ≤ this |
-| `flat_foot_ic_pre_check_frames` | 5 | Frames before IC (plus IC) for toe−heel flat check; post-IC excluded |
+| `flat_foot_toe_heel_mm` | 10 mm | \|toe−heel\| threshold for flat-foot geometry |
+| `flat_foot_toe_heel_window_frames` | 7 | Frames ending at IC for toe−heel flat check (inclusive) |
+| `flat_foot_toe_heel_min_hits` | 4 | Minimum frames in that window with \|toe−heel\| ≤ threshold (4-of-7) |
+| `flat_foot_ic_pre_check_frames` | 6 | Legacy alias: window length − 1; prefer `flat_foot_toe_heel_window_frames` |
 | `flat_foot_vz_prominence` | 80 mm/s | Prominence for downward-Vz peaks in flat IC re-pick (latest peak at or after first toe descent) |
 | `flat_foot_swing_margin_frames` | 10 | Frames after swing peak before landing search |
 | `flat_foot_landing_max_frames` | 100 | Max frames after swing peak to search for landing |

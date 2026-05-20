@@ -69,10 +69,13 @@ def detect_gait_events_foot_based(markers, setup, raw_markers=None,
                                      ts_accel_peak_min=10000,
                                      to_accel_peak_min=10000,
                                      to_min_velocity_at_peak=100,
+                                     to_az_peak_distance_frames=2,
                                      to_post_rise_frames=10,
                                      to_post_rise_min=15,
                                      flat_foot_toe_heel_mm=10.0,
-                                     flat_foot_ic_pre_check_frames=5,
+                                     flat_foot_toe_heel_window_frames=7,
+                                     flat_foot_toe_heel_min_hits=4,
+                                     flat_foot_ic_pre_check_frames=6,
                                      flat_foot_ground_tolerance_mm=60.0,
                                      flat_foot_vz_prominence=80.0,
                                      flat_foot_swing_margin_frames=10,
@@ -100,9 +103,10 @@ def detect_gait_events_foot_based(markers, setup, raw_markers=None,
 
         Flat-foot refinement (when toe Z is available): after normal HS per cycle,
         if the IC is flat-foot at contact, re-pick IC from descent-Vz peaks.
-        Flat-foot requires BOTH (a) min |toe−heel| over IC and the preceding
-        ``flat_foot_ic_pre_check_frames`` (default 5) is ≤ ``flat_foot_toe_heel_mm``
-        (default 10 mm), AND (b) ≥ ``flat_foot_pre_ic_min_hits`` of the
+        Flat-foot requires BOTH (a) ≥ ``flat_foot_toe_heel_min_hits`` of
+        ``flat_foot_toe_heel_window_frames`` ending at IC (default 4-of-7) have
+        |toe−heel| ≤ ``flat_foot_toe_heel_mm`` (default 10 mm), AND (b) ≥
+        ``flat_foot_pre_ic_min_hits`` of the
         ``flat_foot_pre_ic_check_frames`` frames before IC have
         ``flat_foot_pre_ic_vz_min ≤ heel Vz ≤ flat_foot_pre_ic_vz_max`` (default
         −100–0 mm/s for 3-of-5), capturing slow flat-foot approach before IC.
@@ -110,19 +114,17 @@ def detect_gait_events_foot_based(markers, setup, raw_markers=None,
         is flat-foot, IC is the later of the toe/heel strongest descent-Vz peak
         (lowest Vz at peak) strictly between the first and deepest crossings.
 
-    TO Detection (per toe swing cycle):
-        Positive Az peak (≥10000 mm/s²) per IC–swing window where:
-        - Vz > 100 mm/s at the peak (toe not descending)
-        - Z near ground (≤+100mm; forefoot push-off after roll-off)
-        - Z continues rising ≥15mm in next 10 frames OR ≥50mm by swing peak
-          (swing-peak waiver not applied after a toe-down approach)
-        - Reject if ≥4 consecutive frames with Vz < −50 mm/s within 8 frames
-          after the Az peak (toe-down after spike, not toe-rise push-off)
-        - Post-Az toe-rise: ≥5 consecutive Vz > 0, ≤1 negative Vz in first 3
-          post-peak frames, and a post-Az Vz peak strictly after the Az frame
-          that exceeds Vz@peak and is ≥400 mm/s (no 20% growth requirement)
-        - Multiple valid peaks in one window: lowest toe Z at the peak (earlier
-          frame on ties); TO is floor departure near minimum height
+    TO Detection (primary + optional gap fill):
+
+        Primary — per-foot ``_detect_toe_off`` (IC/swing-bounded Az peaks with
+        rise and post-Az Vz push-off checks; ``to_az_peak_distance_frames``=2).
+        Multiple validated peaks in one window: **earliest** frame (first
+        push-off spike; later spikes in the same burst are often roll/strike).
+
+        Gap fill (only when needed) — for each **consecutive IC pair** in time,
+        if no TO on the foot **opposite** the first IC lies strictly between
+        those ICs, run the **same strict** TO picker in that window only. Still
+        absent after gap fill is valid (e.g. jump).
 
     TS Detection (with strict criteria to reject stance-phase artifacts):
         Per cycle in toe Z, find deepest Z sign-change with:
@@ -164,6 +166,9 @@ def detect_gait_events_foot_based(markers, setup, raw_markers=None,
     # Use raw markers for event detection if available
     detect_markers = raw_markers if raw_markers is not None else markers
 
+    # Per-side IC lists + hs_frames for contralateral TO gap fill.
+    side_ic_data: dict[str, tuple[list[tuple[int, str]], np.ndarray, list]] = {}
+
     for side, heel_name, toe_name, hs_list, to_list, strike_list in [
         ('left', 'LHEE', 'LTOE', events.left_hs, events.left_to,
          events.left_strike_types),
@@ -185,6 +190,8 @@ def detect_gait_events_foot_based(markers, setup, raw_markers=None,
             swing_distance=swing_distance_frames,
             ground_tolerance=hs_ground_tolerance_mm,
             flat_foot_toe_heel_mm=flat_foot_toe_heel_mm,
+            flat_foot_toe_heel_window_frames=flat_foot_toe_heel_window_frames,
+            flat_foot_toe_heel_min_hits=flat_foot_toe_heel_min_hits,
             flat_foot_ic_pre_check_frames=flat_foot_ic_pre_check_frames,
             flat_foot_ground_tolerance_mm=flat_foot_ground_tolerance_mm,
             flat_foot_vz_prominence=flat_foot_vz_prominence,
@@ -202,6 +209,8 @@ def detect_gait_events_foot_based(markers, setup, raw_markers=None,
             _refine_flat_foot_hs_at_ics(
                 heel_z, toe_z, fs, hs_raw,
                 flat_foot_toe_heel_mm=flat_foot_toe_heel_mm,
+                flat_foot_toe_heel_window_frames=flat_foot_toe_heel_window_frames,
+                flat_foot_toe_heel_min_hits=flat_foot_toe_heel_min_hits,
                 flat_foot_ic_pre_check_frames=flat_foot_ic_pre_check_frames,
                 flat_foot_vz_prominence=flat_foot_vz_prominence,
                 flat_foot_swing_margin_frames=flat_foot_swing_margin_frames,
@@ -222,7 +231,7 @@ def detect_gait_events_foot_based(markers, setup, raw_markers=None,
                 if s - cleaned[-1] >= min_separation_frames:
                     cleaned.append(s)
             hs_frames = cleaned
-        # TO detection uses HS-bounded search (more accurate at trial start)
+        # TO from HS/swing windows (strict Az + rise + post-Az Vz checks).
         to_frames = _detect_toe_off(
             toe_z, fs,
             hs_frames=hs_frames,
@@ -232,6 +241,7 @@ def detect_gait_events_foot_based(markers, setup, raw_markers=None,
             post_rise_frames=to_post_rise_frames,
             post_rise_min=to_post_rise_min,
             min_separation=min_separation_frames,
+            az_peak_distance=to_az_peak_distance_frames,
         )
         ts_candidates = _detect_toe_strike_candidates(
             toe_z, fs,
@@ -309,11 +319,38 @@ def detect_gait_events_foot_based(markers, setup, raw_markers=None,
         ics_with_types.sort(key=lambda x: x[0])
         ics_with_types = _dedupe_nearby_ics(ics_with_types, min_separation_frames)
 
+        side_ic_data[side] = (ics_with_types, toe_z, hs_frames)
         for f, t in ics_with_types:
             hs_list.append(int(f))
             strike_list.append(t)
         for to_f in to_frames:
             to_list.append(int(to_f))
+
+    ic_stream: list[tuple[int, str]] = []
+    for side in ('left', 'right'):
+        if side in side_ic_data:
+            for f, _ in side_ic_data[side][0]:
+                ic_stream.append((int(f), side))
+    ic_stream.sort(key=lambda x: x[0])
+
+    left_toe = detect_markers.get('LTOE')
+    right_toe = detect_markers.get('RTOE')
+    if left_toe is not None and right_toe is not None and len(ic_stream) >= 2:
+        hs_by_side = {
+            s: side_ic_data[s][2] for s in ('left', 'right') if s in side_ic_data}
+        _fill_missing_contralateral_to_between_consecutive_ics(
+            left_toe[:, 2], right_toe[:, 2], fs, ic_stream,
+            events.left_to, events.right_to,
+            frame_labels=frame_labels,
+            hs_by_side=hs_by_side,
+            accel_peak_min=to_accel_peak_min,
+            min_velocity_at_peak=to_min_velocity_at_peak,
+            post_rise_frames=to_post_rise_frames,
+            post_rise_min=to_post_rise_min,
+            ic_min_gap=5,
+            min_separation=min_separation_frames,
+            az_peak_distance=to_az_peak_distance_frames,
+        )
 
     events.left_to.sort()
     events.right_to.sort()
@@ -414,6 +451,24 @@ def _min_toe_heel_diff_at_frame(heel_z, toe_z, frame, *, pre_frames=5,
     return float(np.nanmin(diffs))
 
 
+def _toe_heel_within_threshold_hits(heel_z, toe_z, ic_frame, *,
+                                      window_frames=7,
+                                      max_toe_heel_mm=10.0):
+    """Count frames in [IC − (window_frames − 1), IC] with |toe−heel| ≤ threshold."""
+    if window_frames <= 0 or max_toe_heel_mm < 0:
+        return 0
+    ic = int(ic_frame)
+    lo = max(0, ic - window_frames + 1)
+    hi = ic + 1
+    hits = 0
+    for j in range(lo, hi):
+        if not np.isfinite(heel_z[j]) or not np.isfinite(toe_z[j]):
+            continue
+        if float(abs(toe_z[j] - heel_z[j])) <= max_toe_heel_mm:
+            hits += 1
+    return hits
+
+
 def _has_pre_ic_slow_heel_vz(heel_z, fs, ic_frame, *,
                               pre_check_frames=5,
                               min_hits=3,
@@ -440,7 +495,9 @@ def _has_pre_ic_slow_heel_vz(heel_z, fs, ic_frame, *,
 
 def _is_flat_foot_at_ic(heel_z, toe_z, ic_frame, *, fs,
                          max_toe_heel_mm=10.0,
-                         ic_pre_check_frames=5,
+                         toe_heel_window_frames=7,
+                         toe_heel_min_hits=4,
+                         ic_pre_check_frames=6,
                          flat_foot_pre_ic_check_frames=5,
                          flat_foot_pre_ic_min_hits=3,
                          flat_foot_pre_ic_vz_min=-100.0,
@@ -450,16 +507,20 @@ def _is_flat_foot_at_ic(heel_z, toe_z, ic_frame, *, fs,
                          post_hs_plateau_search_frames=40):
     """True when flat at contact AND slow pre-IC heel approach.
 
-    (1) Min |toe−heel| at IC and preceding ``ic_pre_check_frames`` ≤ threshold.
+    (1) ≥ ``toe_heel_min_hits`` of ``toe_heel_window_frames`` ending at IC have
+        |toe−heel| ≤ ``max_toe_heel_mm``.
     (2) ≥ ``flat_foot_pre_ic_min_hits`` of ``flat_foot_pre_ic_check_frames`` frames
         before IC with ``flat_foot_pre_ic_vz_min ≤ heel Vz ≤ flat_foot_pre_ic_vz_max``.
     """
-    del post_hs_plateau_vz_mm_s, post_hs_plateau_frames, post_hs_plateau_search_frames
+    del (post_hs_plateau_vz_mm_s, post_hs_plateau_frames,
+         post_hs_plateau_search_frames, ic_pre_check_frames)
     if max_toe_heel_mm < 0:
         return False
-    geom = (_min_toe_heel_diff_at_frame(
-        heel_z, toe_z, ic_frame, pre_frames=ic_pre_check_frames, post_frames=0)
-            <= max_toe_heel_mm)
+    geom = (_toe_heel_within_threshold_hits(
+        heel_z, toe_z, ic_frame,
+        window_frames=toe_heel_window_frames,
+        max_toe_heel_mm=max_toe_heel_mm,
+    ) >= toe_heel_min_hits)
     if not geom:
         return False
     return _has_pre_ic_slow_heel_vz(
@@ -583,7 +644,9 @@ def _cycle_for_frame(cycles, frame):
 
 def _refine_flat_foot_hs_at_ics(heel_z, toe_z, fs, hs_frames, *,
                                  flat_foot_toe_heel_mm=10.0,
-                                 flat_foot_ic_pre_check_frames=5,
+                                 flat_foot_toe_heel_window_frames=7,
+                                 flat_foot_toe_heel_min_hits=4,
+                                 flat_foot_ic_pre_check_frames=6,
                                  flat_foot_vz_prominence=80.0,
                                  flat_foot_swing_margin_frames=10,
                                  flat_foot_landing_max_frames=100,
@@ -608,7 +671,8 @@ def _refine_flat_foot_hs_at_ics(heel_z, toe_z, fs, hs_frames, *,
         if not _is_flat_foot_at_ic(
                 heel_z, toe_z, hs, fs=fs,
                 max_toe_heel_mm=flat_foot_toe_heel_mm,
-                ic_pre_check_frames=flat_foot_ic_pre_check_frames,
+                toe_heel_window_frames=flat_foot_toe_heel_window_frames,
+                toe_heel_min_hits=flat_foot_toe_heel_min_hits,
                 post_hs_plateau_vz_mm_s=flat_foot_post_hs_plateau_vz_mm_s,
                 post_hs_plateau_frames=flat_foot_post_hs_plateau_frames):
             refined.append(int(hs))
@@ -730,7 +794,9 @@ def _detect_heel_strike_raw(heel_z, fs, toe_z=None, swing_height=80,
                                min_pre_descent_speed=30,
                                toe_swing_height=50, toe_swing_distance=50,
                                flat_foot_toe_heel_mm=10.0,
-                               flat_foot_ic_pre_check_frames=5,
+                               flat_foot_toe_heel_window_frames=7,
+                               flat_foot_toe_heel_min_hits=4,
+                               flat_foot_ic_pre_check_frames=6,
                                flat_foot_vz_prominence=80.0,
                                flat_foot_swing_margin_frames=10,
                                flat_foot_landing_max_frames=100,
@@ -796,7 +862,8 @@ def _detect_heel_strike_raw(heel_z, fs, toe_z=None, swing_height=80,
             ff_kw = dict(
                 fs=fs,
                 max_toe_heel_mm=flat_foot_toe_heel_mm,
-                ic_pre_check_frames=flat_foot_ic_pre_check_frames,
+                toe_heel_window_frames=flat_foot_toe_heel_window_frames,
+                toe_heel_min_hits=flat_foot_toe_heel_min_hits,
             )
             if (_is_flat_foot_at_ic(heel_z, toe_z, deepest_pick, **ff_kw)
                     and first_pick != deepest_pick):
@@ -829,7 +896,9 @@ def _detect_heel_strike_zmin(heel_z, fs, toe_z=None, swing_height=80,
                                 min_pre_descent_speed=30,
                                 toe_swing_height=50, toe_swing_distance=50,
                                 flat_foot_toe_heel_mm=10.0,
-                                flat_foot_ic_pre_check_frames=5,
+                                flat_foot_toe_heel_window_frames=7,
+                                flat_foot_toe_heel_min_hits=4,
+                                flat_foot_ic_pre_check_frames=6,
                                 flat_foot_vz_prominence=80.0,
                                 flat_foot_swing_margin_frames=10,
                                 flat_foot_landing_max_frames=100,
@@ -850,6 +919,8 @@ def _detect_heel_strike_zmin(heel_z, fs, toe_z=None, swing_height=80,
         min_pre_descent_speed=min_pre_descent_speed,
         toe_swing_height=toe_swing_height, toe_swing_distance=toe_swing_distance,
         flat_foot_toe_heel_mm=flat_foot_toe_heel_mm,
+        flat_foot_toe_heel_window_frames=flat_foot_toe_heel_window_frames,
+        flat_foot_toe_heel_min_hits=flat_foot_toe_heel_min_hits,
         flat_foot_ic_pre_check_frames=flat_foot_ic_pre_check_frames,
         flat_foot_vz_prominence=flat_foot_vz_prominence,
         flat_foot_swing_margin_frames=flat_foot_swing_margin_frames,
@@ -862,6 +933,8 @@ def _detect_heel_strike_zmin(heel_z, fs, toe_z=None, swing_height=80,
         strikes = _refine_flat_foot_hs_at_ics(
             heel_z, toe_z, fs, strikes,
             flat_foot_toe_heel_mm=flat_foot_toe_heel_mm,
+            flat_foot_toe_heel_window_frames=flat_foot_toe_heel_window_frames,
+            flat_foot_toe_heel_min_hits=flat_foot_toe_heel_min_hits,
             flat_foot_ic_pre_check_frames=flat_foot_ic_pre_check_frames,
             flat_foot_vz_prominence=flat_foot_vz_prominence,
             flat_foot_swing_margin_frames=flat_foot_swing_margin_frames,
@@ -920,8 +993,12 @@ def _az_peak_followed_by_vz_pushoff(
     True when Az peak at ``ap`` is followed by sustained toe-rise Vz (push-off),
     not a one-frame bump at the bottom of a descent or plateau noise.
 
-    Post-Az Vz must reach a peak after the Az frame (no 20% growth over Vz@peak;
-    high-speed push-offs often peak at or just after the Az spike).
+    When ``vz0`` at the Az frame is already ≥ ``min_post_vz_peak`` and at least
+    ``min_consecutive_positive`` consecutive post-Az frames have Vz > 0, accept
+    even if Vz does not grow after the spike (push-off often peaks with Az; Vz
+    stays positive but decreases toward swing apex).
+
+    Otherwise require a higher Vz peak strictly after the Az frame.
     """
     vz0 = velocity[ap]
     if not np.isfinite(vz0) or vz0 <= 0:
@@ -953,6 +1030,8 @@ def _az_peak_followed_by_vz_pushoff(
             run = 0
     if max_run < min_consecutive_positive:
         return False
+    if vz0 >= min_post_vz_peak:
+        return True
     if peak_post_idx <= ap:
         return False
     if peak_post_vz < min_post_vz_peak:
@@ -960,24 +1039,193 @@ def _az_peak_followed_by_vz_pushoff(
     return peak_post_vz > vz0
 
 
+def _toe_off_strict_candidates_in_window(
+    toe_z,
+    velocity,
+    accel,
+    az_peaks,
+    ground_z,
+    look_back: int,
+    search_end: int,
+    *,
+    frame_labels=None,
+    hs_frames=None,
+    min_velocity_at_peak=100,
+    post_rise_frames=10,
+    post_rise_min=15,
+    post_az_vz_early_window=20,
+    post_az_min_consecutive_positive_vz=5,
+    max_early_az_frame=10,
+    max_early_hs_frame=30,
+) -> list[int]:
+    """Az peaks in [look_back, search_end) passing the same checks as ``_detect_toe_off``."""
+    n = len(toe_z)
+    candidates: list[int] = []
+    for ap in az_peaks:
+        if look_back <= ap < search_end:
+            if _to_skip_early_transient_az(
+                    int(ap), hs_frames, frame_labels,
+                    max_early_az_frame=max_early_az_frame,
+                    max_early_hs_frame=max_early_hs_frame):
+                continue
+            if velocity[ap] <= min_velocity_at_peak:
+                continue
+            if toe_z[ap] > ground_z + 100:
+                continue
+            check_idx = min(n - 1, ap + post_rise_frames)
+            z_rise_short = toe_z[check_idx] - toe_z[ap]
+            z_rise_to_peak = (
+                np.nanmax(toe_z[ap:search_end]) - toe_z[ap]
+                if ap < search_end else 0.0)
+            toe_down_after = _az_peak_followed_by_toe_down(velocity, ap)
+            if z_rise_short < post_rise_min:
+                if (np.isnan(z_rise_to_peak) or z_rise_to_peak < 50
+                        or toe_down_after):
+                    continue
+            if toe_down_after:
+                continue
+            if not _az_peak_followed_by_vz_pushoff(
+                    velocity, ap,
+                    early_window=post_az_vz_early_window,
+                    min_consecutive_positive=post_az_min_consecutive_positive_vz):
+                continue
+            candidates.append(int(ap))
+    return candidates
+
+
+def _pick_toe_off_strict_in_window(
+    toe_z,
+    fs,
+    win_start: int,
+    win_end: int,
+    *,
+    frame_labels=None,
+    hs_frames=None,
+    accel_peak_min=10000,
+    min_velocity_at_peak=100,
+    post_rise_frames=10,
+    post_rise_min=15,
+    post_az_vz_early_window=20,
+    post_az_min_consecutive_positive_vz=5,
+    max_early_az_frame=10,
+    max_early_hs_frame=30,
+    az_peak_distance=2,
+) -> int | None:
+    """One strict TO frame in [win_start, win_end), or None."""
+    if win_start >= win_end:
+        return None
+    velocity = _backward_diff(toe_z, 1 / fs)
+    accel = _backward_diff(velocity, 1 / fs)
+    valid = toe_z[~np.isnan(toe_z)]
+    if len(valid) == 0:
+        return None
+    ground_z = float(np.percentile(valid, 5))
+    az_peaks, _ = _find_peaks_nan_safe(
+        accel, height=accel_peak_min, distance=az_peak_distance)
+    candidates = _toe_off_strict_candidates_in_window(
+        toe_z, velocity, accel, az_peaks, ground_z,
+        win_start, win_end,
+        frame_labels=frame_labels,
+        hs_frames=hs_frames,
+        min_velocity_at_peak=min_velocity_at_peak,
+        post_rise_frames=post_rise_frames,
+        post_rise_min=post_rise_min,
+        post_az_vz_early_window=post_az_vz_early_window,
+        post_az_min_consecutive_positive_vz=post_az_min_consecutive_positive_vz,
+        max_early_az_frame=max_early_az_frame,
+        max_early_hs_frame=max_early_hs_frame,
+    )
+    if not candidates:
+        return None
+    return _pick_to_az_candidate(candidates, toe_z)
+
+
+def _fill_missing_contralateral_to_between_consecutive_ics(
+    left_toe_z,
+    right_toe_z,
+    fs,
+    ic_stream,
+    left_to_frames,
+    right_to_frames,
+    *,
+    frame_labels=None,
+    hs_by_side: dict[str, list] | None = None,
+    accel_peak_min=10000,
+    min_velocity_at_peak=100,
+    post_rise_frames=10,
+    post_rise_min=15,
+    ic_min_gap=5,
+    min_separation=40,
+    post_az_vz_early_window=20,
+    post_az_min_consecutive_positive_vz=5,
+    max_early_az_frame=10,
+    max_early_hs_frame=30,
+    az_peak_distance=2,
+) -> None:
+    """
+    Gap fill: only for consecutive IC pairs (IC_i, IC_{i+1}).
+
+    If no TO on the foot contralateral to IC_i lies strictly between IC_i and
+    IC_{i+1}, try strict ``_detect_toe_off`` criteria in that window. If none
+    is found, leave the gap (e.g. jump).
+    """
+    if len(ic_stream) < 2:
+        return
+
+    toe_by_side = {'left': left_toe_z, 'right': right_toe_z}
+    to_by_side = {'left': left_to_frames, 'right': right_to_frames}
+    hs_by_side = hs_by_side or {}
+
+    def _has_to_strictly_between(side: str, lo: int, hi: int) -> bool:
+        return any(lo < t < hi for t in to_by_side[side])
+
+    for i in range(len(ic_stream) - 1):
+        ic_a, side_a = ic_stream[i]
+        ic_b, _side_b = ic_stream[i + 1]
+        opp_side = 'right' if side_a == 'left' else 'left'
+        win_start = int(ic_a) + ic_min_gap
+        win_end = int(ic_b)
+        if win_start >= win_end:
+            continue
+        if _has_to_strictly_between(opp_side, ic_a, ic_b):
+            continue
+
+        pick = _pick_toe_off_strict_in_window(
+            toe_by_side[opp_side],
+            fs,
+            win_start,
+            win_end,
+            frame_labels=frame_labels,
+            hs_frames=hs_by_side.get(opp_side),
+            accel_peak_min=accel_peak_min,
+            min_velocity_at_peak=min_velocity_at_peak,
+            post_rise_frames=post_rise_frames,
+            post_rise_min=post_rise_min,
+            post_az_vz_early_window=post_az_vz_early_window,
+            post_az_min_consecutive_positive_vz=post_az_min_consecutive_positive_vz,
+            max_early_az_frame=max_early_az_frame,
+            max_early_hs_frame=max_early_hs_frame,
+            az_peak_distance=az_peak_distance,
+        )
+        if pick is None:
+            continue
+        existing = to_by_side[opp_side]
+        if any(abs(pick - t) < min_separation for t in existing):
+            continue
+        existing.append(int(pick))
+
+
 def _pick_to_az_candidate(
     candidates: list[int],
-    velocity: np.ndarray,
     toe_z: np.ndarray,
 ) -> int:
     """
-    Among validated Az peaks in one swing window, pick the lowest toe Z at the
-    peak (TO leaves the floor near minimum height). Ties: earlier frame.
+    Among validated Az peaks in one swing window, pick the earliest frame.
+
+    TO is the first push-off spike in a burst; later peaks (often larger Az)
+    tend to be roll-over or pre-strike transients in the same stance.
     """
-    if len(candidates) == 1:
-        return candidates[0]
-    return min(
-        candidates,
-        key=lambda ap: (
-            float(toe_z[ap]) if np.isfinite(toe_z[ap]) else np.inf,
-            ap,
-        ),
-    )
+    return min(candidates)
 
 
 def _detect_toe_off(toe_z, fs, hs_frames=None, frame_labels=None,
@@ -988,7 +1236,8 @@ def _detect_toe_off(toe_z, fs, hs_frames=None, frame_labels=None,
                        post_az_vz_early_window=20,
                        post_az_min_consecutive_positive_vz=5,
                        max_early_az_frame=10,
-                       max_early_hs_frame=30):
+                       max_early_hs_frame=30,
+                       az_peak_distance=2):
     """
     TO = first positive Az peak per swing cycle, with sustained motion check.
 
@@ -1014,7 +1263,8 @@ def _detect_toe_off(toe_z, fs, hs_frames=None, frame_labels=None,
 
     swing_peaks, _ = _find_peaks_nan_safe(toe_z, height=ground_z + 30,
                                              distance=80, prominence=20)
-    az_peaks, _ = _find_peaks_nan_safe(accel, height=accel_peak_min, distance=8)
+    az_peaks, _ = _find_peaks_nan_safe(
+        accel, height=accel_peak_min, distance=az_peak_distance)
 
     to_frames = []
     for sp_idx, sp in enumerate(swing_peaks):
@@ -1037,37 +1287,21 @@ def _detect_toe_off(toe_z, fs, hs_frames=None, frame_labels=None,
             prev_sp_arr = swing_peaks[swing_peaks < sp]
             look_back = prev_sp_arr[-1] + 5 if len(prev_sp_arr) > 0 else 0
 
-        candidates = []
-        for ap in az_peaks:
-            if look_back <= ap < sp:
-                if _to_skip_early_transient_az(
-                        int(ap), hs_frames, frame_labels,
-                        max_early_az_frame=max_early_az_frame,
-                        max_early_hs_frame=max_early_hs_frame):
-                    continue
-                if velocity[ap] <= min_velocity_at_peak:
-                    continue
-                # Az peak may occur after the toe has rolled off the ground.
-                if toe_z[ap] > ground_z + 100:
-                    continue
-                # Accept slow risers: short-window rise OR rise to swing peak.
-                check_idx = min(n - 1, ap + post_rise_frames)
-                z_rise_short = toe_z[check_idx] - toe_z[ap]
-                z_rise_to_peak = toe_z[sp] - toe_z[ap]
-                toe_down_after = _az_peak_followed_by_toe_down(velocity, ap)
-                if z_rise_short < post_rise_min:
-                    if z_rise_to_peak < 50 or toe_down_after:
-                        continue
-                if toe_down_after:
-                    continue
-                if not _az_peak_followed_by_vz_pushoff(
-                        velocity, ap,
-                        early_window=post_az_vz_early_window,
-                        min_consecutive_positive=post_az_min_consecutive_positive_vz):
-                    continue
-                candidates.append(ap)
+        candidates = _toe_off_strict_candidates_in_window(
+            toe_z, velocity, accel, az_peaks, ground_z,
+            look_back, min(n, sp + 1),
+            frame_labels=frame_labels,
+            hs_frames=hs_frames,
+            min_velocity_at_peak=min_velocity_at_peak,
+            post_rise_frames=post_rise_frames,
+            post_rise_min=post_rise_min,
+            post_az_vz_early_window=post_az_vz_early_window,
+            post_az_min_consecutive_positive_vz=post_az_min_consecutive_positive_vz,
+            max_early_az_frame=max_early_az_frame,
+            max_early_hs_frame=max_early_hs_frame,
+        )
         if candidates:
-            to_frames.append(_pick_to_az_candidate(candidates, velocity, toe_z))
+            to_frames.append(_pick_to_az_candidate(candidates, toe_z))
 
     if len(to_frames) > 1:
         cleaned = [to_frames[0]]
@@ -1085,39 +1319,22 @@ def _detect_toe_off(toe_z, fs, hs_frames=None, frame_labels=None,
                 continue
             look_back = hs_a + 5
             search_end = hs_b
-            candidates = []
-            for ap in az_peaks:
-                if look_back <= ap < search_end:
-                    if _to_skip_early_transient_az(
-                            int(ap), hs_frames, frame_labels,
-                            max_early_az_frame=max_early_az_frame,
-                            max_early_hs_frame=max_early_hs_frame):
-                        continue
-                    if velocity[ap] <= min_velocity_at_peak:
-                        continue
-                    if toe_z[ap] > ground_z + 100:
-                        continue
-                    check_idx = min(n - 1, ap + post_rise_frames)
-                    z_rise_short = toe_z[check_idx] - toe_z[ap]
-                    z_rise_to_peak = (
-                        np.nanmax(toe_z[ap:search_end]) - toe_z[ap]
-                        if ap < search_end else 0.0)
-                    toe_down_after = _az_peak_followed_by_toe_down(velocity, ap)
-                    if z_rise_short < post_rise_min:
-                        if (np.isnan(z_rise_to_peak) or z_rise_to_peak < 50
-                                or toe_down_after):
-                            continue
-                    if toe_down_after:
-                        continue
-                    if not _az_peak_followed_by_vz_pushoff(
-                            velocity, ap,
-                            early_window=post_az_vz_early_window,
-                            min_consecutive_positive=post_az_min_consecutive_positive_vz):
-                        continue
-                    candidates.append(ap)
+            candidates = _toe_off_strict_candidates_in_window(
+                toe_z, velocity, accel, az_peaks, ground_z,
+                look_back, search_end,
+                frame_labels=frame_labels,
+                hs_frames=hs_frames,
+                min_velocity_at_peak=min_velocity_at_peak,
+                post_rise_frames=post_rise_frames,
+                post_rise_min=post_rise_min,
+                post_az_vz_early_window=post_az_vz_early_window,
+                post_az_min_consecutive_positive_vz=post_az_min_consecutive_positive_vz,
+                max_early_az_frame=max_early_az_frame,
+                max_early_hs_frame=max_early_hs_frame,
+            )
             if candidates:
                 to_frames.append(
-                    _pick_to_az_candidate(candidates, velocity, toe_z))
+                    _pick_to_az_candidate(candidates, toe_z))
 
     if len(to_frames) > 1:
         to_frames = sorted(set(to_frames))
