@@ -289,12 +289,11 @@ This package is the **spatiotemporal stage** in a multi-repo obstacle-crossing w
 
 | Repository | Role |
 |------------|------|
-| [marker-label](https://github.com/marker-label/marker-label) | C3D → CSV export, auto-labeling, gap-filled full-body trials |
+| [marker-label](https://github.com/yesiam0225/marker-label) | C3D → CSV export, auto-labeling, gap-filled full-body trials |
 | **gait-spatiotemporal** (this repo) | Rule-based IC/TO, strides, steps, obstacle parameters |
-| [gait-mos-kinematics](https://github.com/gait-mos-kinematics/gait-mos-kinematics) | Joint kinematics ensemble, joint peaks, MoS at events |
-| [gait-events-vlm](https://github.com/gait-events-vlm/gait-events-vlm) | VLM IC/TO from foot-Z plots (experimental QC) |
+| [gait-mos-kinematics](https://github.com/yesiam0225/gait-mos-kinematics) | Joint kinematics ensemble, joint peaks, MoS at events |
 
-Typical batch order (see [marker-label downstream docs](https://github.com/marker-label/marker-label#downstream-gait-analysis)):
+Typical batch order (see [marker-label downstream docs](https://github.com/yesiam0225/marker-label#downstream-gait-analysis)):
 
 1. Gap-filled marker CSVs + trial manifest (`obs_trials.csv` or `extra_obs_trials.csv`)
 2. **`spatiotemporal-gait --trial-manifest … --output-dir …`** → `per_stride_data.csv`, `per_step_data.csv`
