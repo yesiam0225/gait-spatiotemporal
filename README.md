@@ -19,12 +19,12 @@ After installation, you can run the same entrypoint as `python -m spatiotemporal
 ```bash
 # Single trial: marker CSV → per-stride CSV (+ per-step CSV alongside by default)
 spatiotemporal-gait --input trial.csv --output strides.csv \
-  --leg-length-mm 850 --subject-id BBA01 --group adult --board RB --time pre --trial 5
+  --leg-length-mm 850 --subject-id SUBJ01 --group adult --board RB --time pre --trial 5
 # Optional: spatiotemporal-gait ... --output-step custom_steps.csv
 
 # Batch: manifest CSV (csv_path + trial per row) + output directory
 spatiotemporal-gait --trial-manifest trials.csv --output-dir ./out \
-  --leg-length-mm 960 --subject-id BBA01 --group adult --board RB --time pre
+  --leg-length-mm 960 --subject-id SUBJ01 --group adult --board RB --time pre
 # If every row includes leg_length_mm, --leg-length-mm may be omitted.
 # Optional manifest columns (override CLI when present): subject_id, group, board,
 # time, leg_length_mm, mass_kg, age_years, height_mm. Aliases: path/input/file for
@@ -73,9 +73,9 @@ Example column names: `frame`, `LHEE_x`, `LHEE_y`, `LHEE_z`, `LTOE_x`, ..., `OBS
 from spatiotemporal import analyze_trial, TrialMetadata, Anthropometry
 
 records, obstacle, events, setup = analyze_trial(
-    csv_path='BBA01_Trial_05.csv',
+    csv_path='SUBJ01_Trial_05.csv',
     metadata=TrialMetadata(
-        subject_id='BBA01',
+        subject_id='SUBJ01',
         group='adult',
         board='RB',
         time='pre',
@@ -102,9 +102,9 @@ from spatiotemporal import analyze_trials, TrialMetadata, Anthropometry
 trial_specs = []
 for trial_num in range(1, 7):
     trial_specs.append({
-        'csv_path': f'data/BBA01_Trial_{trial_num:02d}.csv',
+        'csv_path': f'data/SUBJ01_Trial_{trial_num:02d}.csv',
         'metadata': TrialMetadata(
-            subject_id='BBA01',
+            subject_id='SUBJ01',
             group='adult',
             board='RB',
             time='pre',
@@ -205,9 +205,9 @@ Algorithm validated against manual frame-by-frame identification on three trial 
 
 | Trial | Subject | Direction | Lead foot | HS accuracy | TS accuracy |
 |-------|---------|-----------|-----------|-------------|-------------|
-| BBA01 T5 | Adult | +1 | Right | ±1-2 frames | Exact |
-| BBA02 T5 | Adult | +1 | Left | ±1-2 frames | Exact |
-| BBC01 T23 | Child | -1 | Right | ±1-2 frames | Exact |
+| SUBJ01 T5 | Adult | +1 | Right | ±1-2 frames | Exact |
+| SUBJ02 T5 | Adult | +1 | Left | ±1-2 frames | Exact |
+| SUBJ03 T23 | Child | -1 | Right | ±1-2 frames | Exact |
 
 ## API Reference
 
@@ -282,6 +282,49 @@ gait-spatiotemporal/
     ├── __init__.py   # data classes, I/O, detection, analyze_trial / analyze_trials, CLI
     └── __main__.py   # python -m spatiotemporal
 ```
+
+## Related projects (end-to-end pipeline)
+
+This package is the **spatiotemporal stage** in a multi-repo obstacle-crossing workflow:
+
+| Repository | Role |
+|------------|------|
+| [marker-label](https://github.com/marker-label/marker-label) | C3D → CSV export, auto-labeling, gap-filled full-body trials |
+| **gait-spatiotemporal** (this repo) | Rule-based IC/TO, strides, steps, obstacle parameters |
+| [gait-mos-kinematics](https://github.com/gait-mos-kinematics/gait-mos-kinematics) | Joint kinematics ensemble, joint peaks, MoS at events |
+| [gait-events-vlm](https://github.com/gait-events-vlm/gait-events-vlm) | VLM IC/TO from foot-Z plots (experimental QC) |
+
+Typical batch order (see [marker-label downstream docs](https://github.com/marker-label/marker-label#downstream-gait-analysis)):
+
+1. Gap-filled marker CSVs + trial manifest (`obs_trials.csv` or `extra_obs_trials.csv`)
+2. **`spatiotemporal-gait --trial-manifest … --output-dir …`** → `per_stride_data.csv`, `per_step_data.csv`
+3. Kinematics / MoS / peaks in **gait-mos-kinematics** (or in-repo `gait_analysis/` in marker-label for MoS QC plots)
+
+```bash
+# Main cohort (gap-filled manifest from marker-label)
+spatiotemporal-gait \
+  --trial-manifest corrected/obs_trials_gap_filled.csv \
+  --output-dir gait_spatiotemporal_out \
+  --subject-id PLACEHOLDER --group adult --board RB --time pre
+
+# Extra / added cohort
+spatiotemporal-gait \
+  --trial-manifest corrected/added/extra_obs_trials.csv \
+  --output-dir gait_spatiotemporal_out/extra \
+  --subject-id PLACEHOLDER --group adult --board RB --time pre
+```
+
+Pre-process heel/toe gaps with **marker-label** gap fill before batch runs; missing foot markers produce NaN derivatives and missed events (see Limitations).
+
+### Frame indices
+
+Event columns (`hs_start_frame`, `hs_end_frame`, `to_frame`, `ic_frame`, …) are **0-based row indices** into the trial CSV passed on the command line. Downstream kinematics/MoS scripts use the same convention when slicing marker trajectories.
+
+### Step metrics vs stride phase
+
+- **`per_stride_data.csv`**: one row per same-foot stride; `phase` (`approach`, `crossing_lead`, `crossing_trail`, `recovery`) is assigned per stride relative to the obstacle.
+- **`per_step_data.csv`**: one row per foot IC (landing). `step_length_mm` / `step_width_mm` are stored on the **landing IC** and require a previous opposite-foot IC — the **first IC in a trial is NaN**; trial-end ICs may also lack a following stride row in `per_stride_data.csv`.
+- **Stride phase ≠ contralateral step phase**: a step from opposite-foot HS→HS can span two stride phases (e.g. approach functionally, but ending IC labeled `crossing_trail`). For step-level phase labels, derive a separate export or post-process IC pairs — not yet built into this package.
 
 ## Limitations
 

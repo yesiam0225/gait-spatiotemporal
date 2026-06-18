@@ -248,7 +248,7 @@ def _main():
     3) Many trials (manifest CSV + output dir)::
 
         python spatiotemporal.py --trial-manifest trials.csv --output-dir ./out \\
-            --leg-length-mm 960 --subject-id BBA01 --group adult --board RB --time pre
+            --leg-length-mm 960 --subject-id SUBJ01 --group adult --board RB --time pre
 
         trials.csv: required ``csv_path`` + ``trial`` (aliases: path, input, file;
         ``trial_number`` for trial). Optional per-row columns override CLI defaults:
