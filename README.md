@@ -1,6 +1,10 @@
 # Spatiotemporal Gait Analysis for Obstacle Crossing
 
-A Python package for detecting gait events and computing spatiotemporal parameters from 3D motion capture data of obstacle-crossing walking trials. Designed for biomechanics research with full-body Plug-in Gait marker sets.
+## Overview / Highlights
+
+**Problem:** After labeling, each obstacle-crossing trial needs **reliable IC/TO frames and spatiotemporal parameters** (stride/step timing, speed, obstacle lead/trail context)—without assuming a clean treadmill gait or a fixed heel-strike only pattern.
+
+**Highlights:** **Pelvis-independent** foot-based event detection: heel/toe kinematics, **Z-minimum–priority IC** with descent-velocity peaks, and explicit **heel-strike vs toe-strike (TS)** classification for landings after the obstacle. Automatic **walking setup and obstacle lead/trail** classification; batch export to `per_stride_data.csv` / `per_step_data.csv` with leg-length–normalized metrics and cohort outlier flags.
 
 ## Installation
 
