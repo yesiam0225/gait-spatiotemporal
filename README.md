@@ -9,7 +9,7 @@
 ## Installation
 
 ```bash
-git clone <repository-url> gait-spatiotemporal
+git clone https://github.com/yesiam0225/gait-spatiotemporal.git
 cd gait-spatiotemporal
 pip install -e .
 ```
@@ -314,13 +314,13 @@ Typical batch order (see [marker-label downstream docs](https://github.com/yesia
 spatiotemporal-gait \
   --trial-manifest corrected/obs_trials_gap_filled.csv \
   --output-dir gait_spatiotemporal_out \
-  --subject-id PLACEHOLDER --group adult --board RB --time pre
+  --subject-id SUBJ01 --group adult --board RB --time pre
 
 # Extra / added cohort
 spatiotemporal-gait \
   --trial-manifest corrected/added/extra_obs_trials.csv \
   --output-dir gait_spatiotemporal_out/extra \
-  --subject-id PLACEHOLDER --group adult --board RB --time pre
+  --subject-id SUBJ01 --group adult --board RB --time pre
 ```
 
 Pre-process heel/toe gaps with **marker-label** gap fill before batch runs; missing foot markers produce NaN derivatives and missed events (see Limitations).
@@ -345,16 +345,4 @@ Event columns (`hs_start_frame`, `hs_end_frame`, `to_frame`, `ic_frame`, …) ar
 
 ## License
 
-MIT
-
-## Citation
-
-If you use this package in published research, please cite:
-
-```
-[Citation placeholder - add publication when available]
-```
-
-## Contact
-
-[Your contact information]
+MIT — see [LICENSE](LICENSE).
