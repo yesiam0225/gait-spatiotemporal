@@ -209,6 +209,12 @@ Algorithm validated against manual frame-by-frame identification on three trial 
 | SUBJ02 T5 | Adult | +1 | Left | ±1-2 frames | Exact |
 | SUBJ03 T23 | Child | -1 | Right | ±1-2 frames | Exact |
 
+![Foot-Z trajectories with detected IC/TO (demo)](docs/assets/foot_z_events_demo.png)
+
+*Pre-IRB feasibility demo; consented colleague volunteer — not study participants. Foot Z with rule-based IC (HS/TS) and toe-off; no trial filenames or participant identifiers.*
+
+Regenerate: `pip install -e ".[demo]"` then `python examples/generate_demo_foot_z_plot.py --input path/to/local.csv` (see [examples/README.md](examples/README.md)).
+
 ## API Reference
 
 ### `TrialMetadata(subject_id, group, board, time, trial)`
