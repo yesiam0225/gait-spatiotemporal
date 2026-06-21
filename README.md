@@ -26,7 +26,7 @@ Foot vertical trajectories with rule-based **IC (HS/TS)** and **toe-off** marker
 ```bash
 pip install -e ".[demo]"
 spatiotemporal-gait --input path/to/trial.csv --output strides.csv \
-  --leg-length-mm 850 --subject-id SUBJ01 --trial 5
+  --leg-length-mm 850 --subject-id PARTICIPANT_A --trial 1
 ```
 
 Regenerate PNG: `python examples/generate_demo_foot_z_plot.py --input path/to/local.csv` ([examples/README.md](examples/README.md)).
@@ -62,12 +62,12 @@ After installation, you can run the same entrypoint as `python -m spatiotemporal
 ```bash
 # Single trial: marker CSV → per-stride CSV (+ per-step CSV alongside by default)
 spatiotemporal-gait --input trial.csv --output strides.csv \
-  --leg-length-mm 850 --subject-id SUBJ01 --group adult --board RB --time pre --trial 5
+  --leg-length-mm 850 --subject-id PARTICIPANT_A --group adult --board RB --time pre --trial 1
 # Optional: spatiotemporal-gait ... --output-step custom_steps.csv
 
 # Batch: manifest CSV (csv_path + trial per row) + output directory
 spatiotemporal-gait --trial-manifest trials.csv --output-dir ./out \
-  --leg-length-mm 960 --subject-id SUBJ01 --group adult --board RB --time pre
+  --leg-length-mm 960 --subject-id PARTICIPANT_A --group adult --board RB --time pre
 # If every row includes leg_length_mm, --leg-length-mm may be omitted.
 # Optional manifest columns (override CLI when present): subject_id, group, board,
 # time, leg_length_mm, mass_kg, age_years, height_mm. Aliases: path/input/file for
@@ -116,13 +116,13 @@ Example column names: `frame`, `LHEE_x`, `LHEE_y`, `LHEE_z`, `LTOE_x`, ..., `OBS
 from spatiotemporal import analyze_trial, TrialMetadata, Anthropometry
 
 records, obstacle, events, setup = analyze_trial(
-    csv_path='SUBJ01_Trial_05.csv',
+    csv_path='path/to/trial.csv',
     metadata=TrialMetadata(
-        subject_id='SUBJ01',
+        subject_id='PARTICIPANT_A',
         group='adult',
         board='RB',
         time='pre',
-        trial=5,
+        trial=1,
     ),
     anthro=Anthropometry(leg_length_mm=850, age_years=30),
 )
@@ -145,9 +145,9 @@ from spatiotemporal import analyze_trials, TrialMetadata, Anthropometry
 trial_specs = []
 for trial_num in range(1, 7):
     trial_specs.append({
-        'csv_path': f'data/SUBJ01_Trial_{trial_num:02d}.csv',
+        'csv_path': f'data/trial_{trial_num:02d}.csv',
         'metadata': TrialMetadata(
-            subject_id='SUBJ01',
+            subject_id='PARTICIPANT_A',
             group='adult',
             board='RB',
             time='pre',
@@ -244,15 +244,16 @@ Raw data is used because Butterworth filtering shifts Az peak positions and mask
 
 ## Validation
 
-Algorithm validated against manual frame-by-frame identification on three trial types:
+Event detection was checked against **manual frame-by-frame IC/TO** picks on a diverse audit set (**>10 trials**): adult and child walkers, multiple walking directions, and both lead-foot configurations. On those manually reviewed trials:
 
-| Trial | Subject | Direction | Lead foot | HS accuracy | TS accuracy |
-|-------|---------|-----------|-----------|-------------|-------------|
-| SUBJ01 T5 | Adult | +1 | Right | ±1-2 frames | Exact |
-| SUBJ02 T5 | Adult | +1 | Left | ±1-2 frames | Exact |
-| SUBJ03 T23 | Child | -1 | Right | ±1-2 frames | Exact |
+| Event | Typical agreement vs manual |
+|-------|-----------------------------|
+| Heel-strike (HS) / IC | **±1–2 frames** at 100 Hz |
+| Toe-strike (TS) after the obstacle | **Exact frame** where strict TS criteria apply |
 
-**Demo figure:** [Foot-Z + IC/TO plot](#demo--foot-z-event-detection) (above).
+**Cohort processing:** The same rule-based detector runs in batch on the full study manifest — **24 participants**, **≥20 obstacle-crossing trials per participant** (**≥480 trials** total) — as input to downstream kinematics and MoS. This repository does not include participant identifiers, trial filenames, or raw motion-capture exports.
+
+**Demo figure:** [Foot-Z + IC/TO plot](#demo--foot-z-event-detection) (feasibility clip; colleague volunteer; no IDs in the asset).
 
 ## API Reference
 
@@ -349,13 +350,13 @@ Typical batch order (see [marker-label downstream docs](https://github.com/yesia
 spatiotemporal-gait \
   --trial-manifest corrected/obs_trials_gap_filled.csv \
   --output-dir gait_spatiotemporal_out \
-  --subject-id SUBJ01 --group adult --board RB --time pre
+  --subject-id PARTICIPANT_A --group adult --board RB --time pre
 
 # Extra / added cohort
 spatiotemporal-gait \
   --trial-manifest corrected/added/extra_obs_trials.csv \
   --output-dir gait_spatiotemporal_out/extra \
-  --subject-id SUBJ01 --group adult --board RB --time pre
+  --subject-id PARTICIPANT_A --group adult --board RB --time pre
 ```
 
 Pre-process heel/toe gaps with **marker-label** gap fill before batch runs; missing foot markers produce NaN derivatives and missed events (see Limitations).
