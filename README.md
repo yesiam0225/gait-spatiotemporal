@@ -2,9 +2,48 @@
 
 ## Overview / Highlights
 
-**Problem:** After labeling, each obstacle-crossing trial needs **reliable IC/TO frames and spatiotemporal parameters** (stride/step timing, speed, obstacle lead/trail context)—without assuming a clean treadmill gait or a fixed heel-strike only pattern.
+**Problem:** After labeling, each obstacle-crossing trial needs **reliable IC/TO frames and spatiotemporal parameters** (stride/step timing, speed, obstacle lead/trail context)—without assuming treadmill-like gait or heel-strike-only landings after the obstacle.
 
-**Highlights:** **Pelvis-independent** foot-based event detection: heel/toe kinematics, **Z-minimum–priority IC** with descent-velocity peaks, and explicit **heel-strike vs toe-strike (TS)** classification for landings after the obstacle. Automatic **walking setup and obstacle lead/trail** classification; batch export to `per_stride_data.csv` / `per_step_data.csv` with leg-length–normalized metrics and cohort outlier flags.
+**How we solve it** (rule-based, pelvis-independent):
+
+| Step | Challenge | Approach |
+|------|-----------|----------|
+| **Events** | Pelvis motion / atypical landings | Foot **heel + toe** kinematics only; **Z-minimum–priority IC**; explicit **heel-strike vs toe-strike (TS)** after the obstacle |
+| **TO** | Push-off peaks vs noise | IC-bounded search; raw-marker **backward-difference** derivatives for sharp Az peaks |
+| **Context** | Obstacle crossing setup | Auto **walking axis**, direction, **lead/trail** foot; stride **phase** (`approach`, `crossing_lead`, `crossing_trail`, `recovery`) |
+| **Cohort** | Cross-subject comparison | Leg-length and √(g/L) normalization; IQR **outlier flags**; batch `per_stride_data.csv` / `per_step_data.csv` |
+
+**Highlights:** Portable CLI (`spatiotemporal-gait`); upstream [marker-label](https://github.com/yesiam0225/marker-label), downstream [gait-mos-kinematics](https://github.com/yesiam0225/gait-mos-kinematics). Algorithm detail: [Algorithm Overview](#algorithm-overview), validation: [Validation](#validation).
+
+## Demo — foot-Z event detection
+
+Foot vertical trajectories with rule-based **IC (HS/TS)** and **toe-off** markers:
+
+![Foot-Z trajectories with detected IC/TO (demo)](docs/assets/foot_z_events_demo.png)
+
+*Pre-IRB feasibility demo; consented colleague volunteer — not study participants. No trial filenames or participant identifiers.*
+
+```bash
+pip install -e ".[demo]"
+spatiotemporal-gait --input path/to/trial.csv --output strides.csv \
+  --leg-length-mm 850 --subject-id SUBJ01 --trial 5
+```
+
+Regenerate PNG: `python examples/generate_demo_foot_z_plot.py --input path/to/local.csv` ([examples/README.md](examples/README.md)).
+
+### Pipeline (this repo in context)
+
+```text
+marker-label (label → trim → relabel → gap fill)
+    → gait-spatiotemporal (IC/TO, strides)  ← this repo
+    → gait-mos-kinematics (kinematics, MoS)
+```
+
+| Repo | Portfolio visual |
+|------|------------------|
+| [marker-label](https://github.com/yesiam0225/marker-label) | 3D QC viewer GIF |
+| **gait-spatiotemporal** (here) | Foot-Z + IC/TO plot (above) |
+| [gait-mos-kinematics](https://github.com/yesiam0225/gait-mos-kinematics) | Ensemble kinematics plots (in progress) |
 
 ## Installation
 
@@ -213,11 +252,7 @@ Algorithm validated against manual frame-by-frame identification on three trial 
 | SUBJ02 T5 | Adult | +1 | Left | ±1-2 frames | Exact |
 | SUBJ03 T23 | Child | -1 | Right | ±1-2 frames | Exact |
 
-![Foot-Z trajectories with detected IC/TO (demo)](docs/assets/foot_z_events_demo.png)
-
-*Pre-IRB feasibility demo; consented colleague volunteer — not study participants. Foot Z with rule-based IC (HS/TS) and toe-off; no trial filenames or participant identifiers.*
-
-Regenerate: `pip install -e ".[demo]"` then `python examples/generate_demo_foot_z_plot.py --input path/to/local.csv` (see [examples/README.md](examples/README.md)).
+**Demo figure:** [Foot-Z + IC/TO plot](#demo--foot-z-event-detection) (above).
 
 ## API Reference
 
