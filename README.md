@@ -8,12 +8,24 @@
 
 | Step | Challenge | Approach |
 |------|-----------|----------|
-| **Events** | Pelvis motion / atypical landings | Foot **heel + toe** kinematics only; **Z-minimum–priority IC**; explicit **heel-strike vs toe-strike (TS)** after the obstacle |
+| **Events** | Pelvis motion / atypical landings | Foot **heel + toe** kinematics only; **Z-minimum–priority IC**; **heel-strike (HS)** with **flat-foot refinement**; explicit **toe-strike (TS)** IC after the obstacle |
 | **TO** | Push-off peaks vs noise | IC-bounded search; raw-marker **backward-difference** derivatives for sharp Az peaks |
 | **Context** | Obstacle crossing setup | Auto **walking axis**, direction, **lead/trail** foot; stride **phase** (`approach`, `crossing_lead`, `crossing_trail`, `recovery`) |
 | **Cohort** | Cross-subject comparison | Leg-length and √(g/L) normalization; IQR **outlier flags**; batch `per_stride_data.csv` / `per_step_data.csv` |
 
 **Highlights:** Portable CLI (`spatiotemporal-gait`); upstream [marker-label](https://github.com/yesiam0225/marker-label), downstream [gait-mos-kinematics](https://github.com/yesiam0225/gait-mos-kinematics). Algorithm detail: [Algorithm Overview](#algorithm-overview), validation: [Validation](#validation).
+
+### Initial contact (IC) types
+
+Every foot landing is an **initial contact (IC)**. Output CSVs label each IC as **`HS`** or **`TS`** (`ic_strike_type`, `ic_start_strike_type`):
+
+| Pattern | Role | Detection idea |
+|---------|------|----------------|
+| **Heel-strike (HS)** | Default IC | Deepest near-ground heel Z per cycle (handles biphasic heel-rocker false candidates) |
+| **Flat-foot HS** | HS frame refinement | When toe and heel are co-planar at contact, re-pick IC from descent-velocity peaks instead of a late plateau HS (common on low-swing / post-obstacle steps) |
+| **Toe-strike (TS)** | Separate IC class | Strict toe-Z/Az criteria; validated with following heel rocker; exported as **`TS`**, not mislabeled as HS |
+
+Heel and toe markers drive detection; pelvis motion is not used. See [Heel-Strike Detection](#heel-strike-detection-z-minimum-priority), [Flat-foot landing](#heel-strike-detection-z-minimum-priority), and [Toe-Strike Detection](#toe-strike-detection-strict-criteria).
 
 ## Demo — foot-Z event detection
 
@@ -249,6 +261,7 @@ Event detection was checked against **manual frame-by-frame IC/TO** picks on a d
 | Event | Typical agreement vs manual |
 |-------|-----------------------------|
 | Heel-strike (HS) / IC | **±1–2 frames** at 100 Hz |
+| Flat-foot HS refinement | Same HS label; IC frame re-picked when toe–heel co-planar at contact |
 | Toe-strike (TS) after the obstacle | **Exact frame** where strict TS criteria apply |
 
 **Cohort processing:** The same rule-based detector runs in batch on the full study manifest — **24 participants**, **≥20 obstacle-crossing trials per participant** (**≥480 trials** total) — as input to downstream kinematics and MoS. This repository does not include participant identifiers, trial filenames, or raw motion-capture exports.
